@@ -27,7 +27,7 @@
 
 ## How it works
 
-The Chat page combines the reference workflow—`/setup → /scrape → /rank → /apply`—in one action. Upload a PDF or DOCX resume, verify the extracted profile, then choose **Find & prepare jobs**.
+The Chat page combines the reference workflow—`/setup → /scrape → /rank → /apply`—in one action. Upload a PDF or DOCX resume, verify the extracted profile, then choose **Find & prepare jobs**. The workflow uses a fixed, allowlisted execution plan: independent searches and role packs run concurrently with limits, while dependent steps stay ordered. **A/B timing** lets you compare planned execution with a sequential baseline; timing history stays in the browser and stores durations and counts only.
 
 | Step | What Neural Ant does |
 |---|---|
@@ -45,6 +45,7 @@ Slash commands remain available for individual steps: `/setup`, `/scrape`, `/ran
 - **Understand each match:** ranking uses technical skills (30%), experience (25%), work-style fit (15%), and career alignment (30%), with separate eligibility, language, and location gates. Scores are ranking aids, not ATS scores or hiring predictions.
 - **Keep sponsorship evidence specific:** role language and historical employer filings are displayed separately. A past H-1B/LCA filing does not promise sponsorship for a particular opening. C2C is tracked as an employment type; it does not establish visa sponsorship.
 - **Review before using AI drafting:** local drafts reorder existing resume content. An external AI provider is optional and requires an explicit opt-in; Neural Ant applies best-effort redaction before sending selected resume, profile, and job details. Review every generated document for accuracy.
+- **Measure workflow speed:** the planned run prepares up to two role packs in parallel and combines them in one backend request. External AI drafting runs independent resume/cover-letter calls together, then runs the independent revisions together. The sequential baseline is available from **A/B timing**. Its sequential estimate is calculated from the current run's task durations, so treat it as a directional comparison rather than a controlled benchmark.
 - **Track the search:** shortlist roles, record stages and outcomes, save interview prep and follow-up drafts, and exclude completed or duplicate roles from future one-click preparation.
 - **Use your own files and accounts:** optional MCP tools can search saved listings without exposing resume text or contact details. Email-status review works from messages you choose to paste; Notion export is a one-way CSV.
 

@@ -13,6 +13,8 @@ import re
 import secrets
 import smtplib
 from threading import Event, Thread
+from time import perf_counter
+from types import SimpleNamespace
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -1489,6 +1491,15 @@ class TailorBody(BaseModel):
     confirmed_resume_use: bool = False
     use_external_ai: bool = False
     external_ai_confirmed: bool = False
+    execution_mode: str = Field(default="planned", pattern=r"^(planned|sequential)$")
+
+
+class BatchPrepareBody(BaseModel):
+    job_ids: list[int] = Field(min_length=1, max_length=5)
+    confirmed_resume_use: bool = False
+    use_external_ai: bool = False
+    external_ai_confirmed: bool = False
+    execution_mode: str = Field(default="planned", pattern=r"^(planned|sequential)$")
 
 
 class ManualJobItem(BaseModel):
@@ -3073,6 +3084,169 @@ def final_resume_docx_text_audit(content: bytes, job: JobRow) -> str:
     )
 
 
+def build_application_draft(
+    resume_text: str,
+    job: Any,
+    profile: dict[str, Any],
+    template_bytes: bytes | None,
+    *,
+    use_external_ai: bool,
+    execution_mode: str,
+) -> dict[str, str]:
+    """Build one review pack. Parallel mode fans out only independent model calls."""
+    if use_external_ai:
+        external_resume = redact_external_candidate_text(resume_text, profile)
+        if execution_mode == "planned":
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                resume_future = executor.submit(external_tailor, external_resume, job, profile)
+                cover_future = executor.submit(external_cover_letter, external_resume, job, profile)
+                content, model = resume_future.result()
+                cover_letter, _ = cover_future.result()
+        else:
+            content, model = external_tailor(external_resume, job, profile)
+            cover_letter, _ = external_cover_letter(external_resume, job, profile)
+
+        independent_review, _ = external_application_review(external_resume, job, profile, content, cover_letter)
+        if execution_mode == "planned":
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                resume_future = executor.submit(external_revise_document, "resume", external_resume, job, content, independent_review)
+                cover_future = executor.submit(external_revise_document, "cover letter", external_resume, job, cover_letter, independent_review)
+                content, _ = resume_future.result()
+                cover_letter, _ = cover_future.result()
+        else:
+            content, _ = external_revise_document("resume", external_resume, job, content, independent_review)
+            cover_letter, _ = external_revise_document("cover letter", external_resume, job, cover_letter, independent_review)
+        candidate_name = str(profile.get("preferred_name") or profile.get("name") or "[Your name]").strip()
+        cover_letter = re.sub(r"\[Your name\]", candidate_name, cover_letter, flags=re.I)
+        cover_letter = cover_letter.replace("[Candidate]", candidate_name)
+        local_check = local_application_review(resume_text, job, content, cover_letter)
+        review_notes = f"Independent review ({model})\n{independent_review}\n\n{local_check}"
+    else:
+        content, model = deterministic_tailor(resume_text, job, profile), "local-match-draft"
+        cover_letter = build_local_cover_letter(resume_text, job, profile)
+        review_notes = local_application_review(resume_text, job, content, cover_letter)
+
+    resume_docx = build_resume_docx(profile, job, content, resume_text, template_bytes=template_bytes)
+    review_notes += "\n\n" + final_resume_docx_text_audit(resume_docx, job)
+    return {"content": content, "cover_letter": cover_letter, "review_notes": review_notes, "model": model}
+
+
+@app.post("/api/applications/batch-prepare")
+def batch_prepare_applications(body: BatchPrepareBody, _: None = Depends(require_auth), db: Session = Depends(get_db)):
+    """Prepare up to five independent role packs with a bounded, allowlisted plan."""
+    if not body.confirmed_resume_use:
+        raise HTTPException(status_code=400, detail="Confirm that Neural Ant may use your stored resume to prepare these drafts.")
+    if body.use_external_ai and not body.external_ai_confirmed:
+        raise HTTPException(status_code=400, detail="Opt in to external AI before sending redacted resume and job text to the configured provider.")
+    job_ids = list(dict.fromkeys(body.job_ids))
+    if len(job_ids) != len(body.job_ids):
+        raise HTTPException(status_code=422, detail="Choose each role only once.")
+    started = perf_counter()
+    resume = db.get(ResumeRow, 1)
+    if not resume:
+        raise HTTPException(status_code=409, detail="Upload a resume first.")
+    profile = ensure_profile(db).data or DEFAULT_PROFILE
+    jobs_by_id = {job.id: job for job in db.scalars(select(JobRow).where(JobRow.id.in_(job_ids))).all()}
+    if len(jobs_by_id) != len(job_ids):
+        raise HTTPException(status_code=404, detail="One or more selected roles could not be found.")
+    jobs = [jobs_by_id[job_id] for job_id in job_ids]
+    for job in jobs:
+        failed_gates = [
+            str(value.get("detail", ""))
+            for key, value in (job.fit_breakdown or {}).items()
+            if key.endswith("_gate") and isinstance(value, dict) and value.get("status") == "FAIL"
+        ]
+        if failed_gates:
+            raise HTTPException(status_code=409, detail=f"Drafting is blocked for {job.company_name} — {job.title}: " + " ".join(failed_gates))
+
+    scalar_columns = [column.key for column in JobRow.__table__.columns]
+    job_snapshots = {
+        job.id: SimpleNamespace(**{key: getattr(job, key) for key in scalar_columns})
+        for job in jobs
+    }
+    resume_text = str(resume.extracted_text or "")
+    profile_snapshot = dict(profile)
+    active_template = db.scalars(select(ResumeTemplateRow).where(ResumeTemplateRow.active.is_(True))).first()
+    template_bytes = bytes(active_template.content) if active_template else None
+
+    applications = db.scalars(select(ApplicationRow).where(ApplicationRow.job_id.in_(job_ids))).all()
+    app_by_job = {item.job_id: item for item in applications}
+    for job in jobs:
+        if job.id not in app_by_job:
+            item = ApplicationRow(
+                job_id=job.id,
+                notes="Added by the one-click search and preparation workflow. Review sponsorship and every document before applying.",
+            )
+            db.add(item)
+            app_by_job[job.id] = item
+    db.commit()
+
+    drafts = db.scalars(
+        select(DraftRow).where(DraftRow.job_id.in_(job_ids)).order_by(DraftRow.created_at.desc())
+    ).all()
+    draft_by_job: dict[int, DraftRow] = {}
+    for draft in drafts:
+        draft_by_job.setdefault(draft.job_id, draft)
+
+    results: dict[int, dict[str, Any]] = {}
+    missing: list[int] = []
+    for job in jobs:
+        application = app_by_job[job.id]
+        if str(application.stage).casefold() in {"done", "applied", "archived"}:
+            results[job.id] = {"job_id": job.id, "application_id": application.id, "status": "skipped_completed", "duration_ms": 0}
+        elif job.id in draft_by_job:
+            results[job.id] = {
+                "job_id": job.id, "application_id": application.id, "draft_id": draft_by_job[job.id].id,
+                "status": "existing", "duration_ms": 0,
+            }
+        else:
+            missing.append(job.id)
+
+    def prepare_one(job_id: int) -> tuple[int, dict[str, Any]]:
+        item_started = perf_counter()
+        try:
+            pack = build_application_draft(
+                resume_text,
+                job_snapshots[job_id],
+                profile_snapshot,
+                template_bytes,
+                use_external_ai=body.use_external_ai,
+                execution_mode=body.execution_mode,
+            )
+            return job_id, {"status": "prepared", "pack": pack, "duration_ms": round((perf_counter() - item_started) * 1000)}
+        except HTTPException as exc:
+            return job_id, {"status": "failed", "error": str(exc.detail), "duration_ms": round((perf_counter() - item_started) * 1000)}
+        except Exception as exc:
+            log.exception("Batch application draft failed for job %s (%s)", job_id, exc.__class__.__name__)
+            return job_id, {"status": "failed", "error": "Draft preparation failed. Retry this role from Applications.", "duration_ms": round((perf_counter() - item_started) * 1000)}
+
+    max_workers = min(2, len(missing)) if body.execution_mode == "planned" else 1
+    if missing:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            for job_id, outcome in executor.map(prepare_one, missing):
+                if outcome["status"] == "prepared":
+                    pack = outcome.pop("pack")
+                    draft = DraftRow(job_id=job_id, **pack)
+                    db.add(draft)
+                    db.flush()
+                    outcome["draft_id"] = draft.id
+                    outcome["model"] = draft.model
+                results[job_id] = {
+                    "job_id": job_id,
+                    "application_id": app_by_job[job_id].id,
+                    **outcome,
+                }
+        db.commit()
+
+    return {
+        "execution_mode": body.execution_mode,
+        "max_concurrency": max_workers,
+        "elapsed_ms": round((perf_counter() - started) * 1000),
+        "roles": [results[job_id] for job_id in job_ids],
+        "warning": "Drafts only. Review every claim and complete employer applications yourself.",
+    }
+
+
 @app.post("/api/jobs/{job_id}/tailor")
 def tailor_resume(job_id: int, body: TailorBody, _: None = Depends(require_auth), db: Session = Depends(get_db)):
     if not body.confirmed_resume_use:
@@ -3089,32 +3263,16 @@ def tailor_resume(job_id: int, body: TailorBody, _: None = Depends(require_auth)
     if failed_gates:
         raise HTTPException(status_code=409, detail="Application drafting is blocked by a hard fit gate: " + " ".join(failed_gates))
     profile = ensure_profile(db).data or DEFAULT_PROFILE
-    if body.use_external_ai:
-        external_resume = redact_external_candidate_text(resume.extracted_text, profile)
-        content, model = external_tailor(external_resume, job, profile)
-        cover_letter, _ = external_cover_letter(external_resume, job, profile)
-        independent_review, _ = external_application_review(external_resume, job, profile, content, cover_letter)
-        content, _ = external_revise_document("resume", external_resume, job, content, independent_review)
-        cover_letter, _ = external_revise_document("cover letter", external_resume, job, cover_letter, independent_review)
-        candidate_name = str(profile.get("preferred_name") or profile.get("name") or "[Your name]").strip()
-        cover_letter = re.sub(r"\[Your name\]", candidate_name, cover_letter, flags=re.I)
-        cover_letter = cover_letter.replace("[Candidate]", candidate_name)
-        local_check = local_application_review(resume.extracted_text, job, content, cover_letter)
-        review_notes = f"Independent review ({model})\n{independent_review}\n\n{local_check}"
-    else:
-        content, model = deterministic_tailor(resume.extracted_text, job, profile), "local-match-draft"
-        cover_letter = build_local_cover_letter(resume.extracted_text, job, profile)
-        review_notes = local_application_review(resume.extracted_text, job, content, cover_letter)
     active_template = db.scalars(select(ResumeTemplateRow).where(ResumeTemplateRow.active.is_(True))).first()
-    resume_docx = build_resume_docx(
-        profile,
-        job,
-        content,
+    pack = build_application_draft(
         resume.extracted_text,
-        template_bytes=active_template.content if active_template else None,
+        job,
+        profile,
+        bytes(active_template.content) if active_template else None,
+        use_external_ai=body.use_external_ai,
+        execution_mode=body.execution_mode,
     )
-    review_notes += "\n\n" + final_resume_docx_text_audit(resume_docx, job)
-    draft = DraftRow(job_id=job.id, content=content, cover_letter=cover_letter, review_notes=review_notes, model=model)
+    draft = DraftRow(job_id=job.id, **pack)
     db.add(draft)
     db.commit()
     db.refresh(draft)

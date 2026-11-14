@@ -78,6 +78,22 @@
 .one-click-results li{padding:6px 0}
 .one-click-results li span{display:block;color:var(--muted);font-size:11px}
 .one-click-results li a{display:inline-block;margin-top:3px;color:var(--green);font-size:11px}
+.workflow-benchmark{margin-top:8px;border-top:1px solid var(--line);padding-top:8px;font-size:11px}
+.workflow-benchmark summary{cursor:pointer;color:var(--muted);font-weight:650}
+.workflow-benchmark-body{padding-top:9px}
+.workflow-benchmark-body .field{margin:0 0 6px;max-width:320px}
+.workflow-benchmark-body .field select{min-height:34px}
+.workflow-benchmark-history small{display:block;color:var(--muted);font-size:10px;line-height:1.45;margin-top:7px}
+.workflow-benchmark-stats{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:7px}
+.workflow-benchmark-stats span{display:flex;flex-direction:column;gap:2px;border:1px solid var(--line);border-radius:8px;padding:7px;background:var(--paper)}
+.workflow-benchmark-stats b{font-size:9px;color:var(--muted)}
+.workflow-benchmark-stats strong{font-size:11px;color:var(--ink)}
+.workflow-timing-card{display:grid;grid-template-columns:1fr 1fr;gap:8px;border:1px solid var(--line);background:var(--paper);border-radius:9px;padding:9px;margin:10px 0}
+.workflow-timing-card>div{display:flex;flex-direction:column;gap:2px}
+.workflow-timing-card b{font-size:10px;color:var(--muted)}
+.workflow-timing-card span{font-size:12px;font-weight:700;color:var(--ink)}
+.workflow-timing-card small{grid-column:1/-1;color:var(--muted);font-size:10px}
+@media(max-width:650px){.workflow-timing-card{grid-template-columns:1fr 1fr}}
 @media(max-width:650px){.one-click-card{padding:15px}.one-click-head{display:block}.one-click-button{width:100%;margin-top:13px}.one-click-head h2{font-size:17px}}
 
 /* Neural Ant's quiet, chat-first palette */
