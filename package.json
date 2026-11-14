@@ -5,6 +5,7 @@
   "description": "A personal AI-assisted career search workspace.",
   "type": "module",
   "scripts": {
-    "build": "node scripts/build.mjs"
+    "build": "node scripts/build.mjs",
+    "test": "node --test tests/workflow-plan.test.js"
   }
 }

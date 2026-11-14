@@ -79,12 +79,16 @@ Local mode stores the database and resume under `data/` and listens on your Mac 
 ## Developer workflow
 
 ```bash
-npm run build
+python3 -m venv .venv
+source .venv/bin/activate
 python -m pip install -r requirements.txt
+npm test
+python -m unittest discover -s tests -v
+npm run build
 uvicorn api.main:app --env-file .env.local --reload --host 127.0.0.1 --port 8080
 ```
 
-The API docs are available at `/api/docs` outside production mode. Frontend assets are built from `src/` into `dist/`.
+The API docs are available at `/api/docs` outside production mode. Frontend assets are built from `src/` into `dist/`. The tests use Node's built-in runner and Python's `unittest`; backend tests use temporary storage and do not contact job boards or AI providers.
 
 ## Documentation
 
