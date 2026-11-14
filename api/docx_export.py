@@ -135,11 +135,14 @@ def _render_draft_resume(document: Document, draft_content: str) -> bool:
         for line in lines:
             paragraph = document.add_paragraph()
             is_bullet = line.startswith("• ")
-            _compact_paragraph(paragraph, after=0, line_spacing=0.88)
+            is_role_heading = section_name == "Professional Experience" and not is_bullet
+            _compact_paragraph(paragraph, after=1 if is_role_heading else 0, line_spacing=0.88)
+            if is_role_heading:
+                paragraph.paragraph_format.keep_with_next = True
             if is_bullet:
                 paragraph.paragraph_format.left_indent = Inches(0.18)
                 paragraph.paragraph_format.first_line_indent = Inches(-0.18)
-            _set_run_font(paragraph.add_run(line))
+            _set_run_font(paragraph.add_run(line), bold=is_role_heading)
     return True
 
 

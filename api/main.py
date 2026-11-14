@@ -2546,6 +2546,11 @@ def download_application_resume(application_id: int, _: None = Depends(require_a
         resume.extracted_text,
         template_bytes=active_template.content if active_template else None,
     )
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f'attachment; filename="{resume_filename(profile, application.job)}"'},
+    )
 
 
 def csv_safe_cell(value: Any) -> str:
