@@ -251,7 +251,8 @@ class _ChromeDevtoolsClient:
         if not _CHROME_MCP_BIN.is_file():
             raise ChromeConnectionError("Chrome control is not installed. Restart Neural Ant with run-local.sh.")
         command = [
-            str(_CHROME_MCP_BIN), "--autoConnect", "--no-usage-statistics", "--no-performance-crux",
+            str(_CHROME_MCP_BIN), "--autoConnect", "--experimentalStructuredContent",
+            "--no-usage-statistics", "--no-performance-crux",
             "--no-categoryPerformance", "--no-categoryNetwork", "--no-categoryMemory",
             "--no-categoryEmulation", "--no-categoryNetworkMocks", "--no-categoryWebauthn",
         ]

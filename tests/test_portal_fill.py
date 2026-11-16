@@ -184,6 +184,7 @@ for line in sys.stdin:
                 client.close()
             args = json.loads(args_record.read_text())
         self.assertIn("--autoConnect", args)
+        self.assertIn("--experimentalStructuredContent", args)
         self.assertIn("--no-usage-statistics", args)
         self.assertIn("--no-performance-crux", args)
         self.assertFalse(any("userDataDir" in arg or "user-data-dir" in arg or "isolated" in arg for arg in args))
