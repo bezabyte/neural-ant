@@ -163,6 +163,12 @@ async function loadJobs(){
 function parseManualJobLines(){return $('manualJobLines').value.split(/\r?\n/).map(line=>line.trim()).filter(Boolean).map((line,index)=>{const parts=line.split('|').map(part=>part.trim());if(parts.length<6)throw Error(`Line ${index+1} needs URL | employer | title | location | salary | experience | employment type | sponsorship note | role context`);const hasEmploymentType=parts.length>=9;return{url:parts[0],company_name:parts[1],title:parts[2],location:parts[3],salary_text:parts[4],experience_text:parts[5],employment_type:hasEmploymentType?parts[6]:'Not stated',sponsorship_note:hasEmploymentType?parts[7]:(parts[6]||''),description:parts.slice(hasEmploymentType?8:7).join(' | ')}})}
 async function importManualJobs(){try{const jobs=parseManualJobLines();const r=await api('/jobs/manual',{method:'POST',body:JSON.stringify({jobs})});await loadJobs();toast(`${r.imported} role(s) imported${r.updated?` · ${r.updated} updated`:''} · ${r.review_queue_added||0} added to review`)}catch(e){toast(e.message)}}
 setInterval(()=>{if(document.visibilityState==='visible'&&document.getElementById('agents')?.classList.contains('active'))loadJobs()},60000);
+async function loadSavedDraftPreview(jobId,draftId){
+ const drafts=await api('/drafts');
+ const matches=(Array.isArray(drafts)?drafts:[]).filter(draft=>Number(draft.job_id)===Number(jobId));
+ const draft=matches.find(item=>draftId&&Number(item.id)===Number(draftId))||matches[0];
+ return draft?{content:draft.content||'',cover_letter:draft.cover_letter||'',review_notes:draft.review_notes||'',model:draft.model||''}:null;
+}
 async function prepareApplication(id,button=null){
  const job=savedJobsCache.find(item=>Number(item.id)===Number(id));
  if(!job){toast('This posting is no longer in the current results. Refresh search and try again.');return}
@@ -173,8 +179,14 @@ async function prepareApplication(id,button=null){
   const result=await api('/applications/batch-prepare',{method:'POST',body:JSON.stringify({job_ids:[id],confirmed_resume_use:true,use_external_ai:useAI,external_ai_confirmed:useAI,execution_mode:'planned',include_preview:true})});
   const role=result.roles?.[0];
   if(role?.status==='skipped_completed'){toast('This role is already marked complete and was not prepared again.');return}if(!role||!['prepared','existing'].includes(role.status))throw Error(role?.error||'This role could not be prepared.');
-  const preview=role.draft_preview;
-  if(!preview)throw Error('The draft is saved, but its preview could not be loaded. Open Applications to review it.');
+  const preview=role.draft_preview||await loadSavedDraftPreview(job.id,role.draft_id);
+  if(!preview){
+   preparedApplicationId=role.application_id;
+   if($('applicationPackStatus'))$('applicationPackStatus').textContent='The review pack is saved for this role. Open Applications and expand Documents, notes & interview prep to access it.';
+   showPage('tracker');
+   toast('Review pack saved. Open this role in Applications to access its documents.');
+   return;
+  }
   preparedApplicationId=role.application_id;
   setVal('copilotTitle',job.title);setVal('copilotCompany',job.company);setVal('copilotContext',job.description||'');
   $('taskType').value='resume';renderDraft(preview.content||'');
