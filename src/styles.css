@@ -575,3 +575,91 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,s
 
 .skip-link{position:fixed;z-index:20;top:8px;left:8px;padding:10px 13px;border-radius:9px;background:var(--coral);color:var(--navy);font-size:12px;font-weight:750;text-decoration:none;transform:translateY(-160%);transition:transform .15s ease}
 .skip-link:focus,.skip-link:focus-visible{transform:translateY(0);outline:3px solid var(--navy);outline-offset:3px}
+
+/* Refined brand balance: dark navigation, warm workspace, coral actions. */
+:root{
+  --paper:#FFFAF2;
+  --line:#DED3C2;
+  --muted:#657086;
+  --shadow:0 12px 30px rgba(20,33,61,.075);
+}
+body,.app,.main{background:var(--cream);color:var(--navy)}
+.app{grid-template-columns:220px minmax(0,1fr)}
+.sidebar{background:var(--navy);border-right:0;color:var(--cream);padding:25px 14px 18px;gap:28px;box-shadow:8px 0 28px rgba(20,33,61,.08)}
+.brand strong{color:var(--cream)}
+.brand small{color:#C5CCDA}
+.logo{background:var(--coral);color:var(--navy)}
+.navlabel{color:#AAB5C9}
+.nav button{color:#E7E4DD}
+.nav button:hover{background:#FFFFFF12;color:var(--cream)}
+.nav button.active,.nav button.active:hover{background:var(--coral);color:var(--navy)}
+.nav .ico,.nav button.active .ico{color:inherit}
+.private-card{background:#1C2C4B;border-color:#354461;color:var(--cream)}
+.private-card span{color:#C5CCDA}
+.topbar{background:var(--cream);border-color:var(--line)}
+.profile{color:var(--navy)}
+.profile .avatar{background:var(--coral);color:var(--navy)}
+.content{max-width:1280px}
+.card,.formcard,.chat-workflow{background:var(--paper);border-color:var(--line);box-shadow:var(--shadow)}
+.chat-intro h1{font-size:clamp(34px,4vw,42px);letter-spacing:-1.5px;line-height:1.08}
+.chat-intro p{max-width:580px}
+.chat-workflow{border-top:3px solid var(--coral);border-radius:16px}
+.resume-drop{background:#F8F1E6;border-color:#C9BBA7}
+.resume-drop:hover,.resume-drop:focus-within{background:#FFFCF6;border-color:var(--coral)}
+.upload-icon{background:var(--navy);color:var(--coral)}
+.one-click-button,.btn.primary{background:var(--coral)!important;border-color:var(--coral)!important;color:var(--navy)!important;font-weight:750}
+.one-click-button:hover,.btn.primary:hover{background:#FF8173!important;border-color:#FF8173!important}
+.one-click-button:disabled,.btn.primary:disabled{background:#E6DCCB!important;border-color:#E6DCCB!important;color:#778094!important}
+.btn{box-shadow:none}
+.btn:not(.primary):hover{border-color:#A9AFBB;background:#FFFDF8}
+.pagehead{gap:14px}
+#tracker>.pagehead{display:grid;grid-template-columns:minmax(0,1fr);gap:14px;padding-bottom:16px;border-bottom:1px solid var(--line)}
+#tracker>.pagehead h1{font-size:clamp(25px,3vw,32px);line-height:1.12;letter-spacing:-1px}
+#tracker>.pagehead .sub{max-width:720px}
+#tracker>.pagehead>div:last-child{display:flex!important;align-items:center;justify-content:flex-start;flex-wrap:wrap;gap:8px!important;margin:0}
+#tracker>.pagehead>div:last-child .btn{min-height:36px}
+.application-filters{display:flex;flex-wrap:wrap;overflow:visible;gap:7px;padding:0}
+.application-filter{padding:7px 10px;border-color:#DED3C2;background:#FFFAF2;color:#536078;transition:background .15s ease,border-color .15s ease,transform .15s ease}
+.application-filter:hover{border-color:var(--coral);transform:translateY(-1px)}
+.application-filter span{background:#EEE4D6}
+.application-filter.active{border-color:var(--navy);background:var(--navy);color:var(--cream)}
+.application-filter.active span{background:var(--coral);color:var(--navy)}
+.application-list-toolbar{background:rgba(255,250,242,.75);border-color:var(--line);border-radius:13px}
+.application-row{padding:15px 17px;border-color:#DED3C2;border-radius:14px;background:var(--paper);box-shadow:0 5px 18px rgba(20,33,61,.045);transition:transform .16s ease,box-shadow .16s ease,border-color .16s ease}
+.application-row:hover{transform:translateY(-1px);border-color:#C8BCA9;box-shadow:0 9px 22px rgba(20,33,61,.075)}
+.application-row-title h3{font-size:14px;letter-spacing:-.25px}
+.application-row-title p{font-size:11px}
+.application-row-actions{border-color:#EEE4D6}
+.application-fit{background:#FFE2DC;color:var(--navy)}
+.application-stage{background:#EEE4D6;color:#536078}
+.application-row-actions .btn{min-height:33px}
+.application-item-details{border-color:#EEE4D6}
+.toast{background:var(--navy);border-left:4px solid var(--coral);color:var(--cream)}
+@media(max-width:950px){
+  .app{grid-template-columns:205px minmax(0,1fr)}
+  .content{padding:20px 20px 40px}
+  .sidebar{padding-right:12px;padding-left:12px}
+}
+@media(max-width:650px){
+  .app{display:block}
+  .sidebar{position:sticky;top:0;z-index:4;height:auto;padding:9px 10px 7px;gap:8px;display:block;background:var(--navy);border-bottom:1px solid #263758;box-shadow:0 5px 14px rgba(20,33,61,.12)}
+  .brand{padding:0 3px 7px}
+  .brand strong{font-size:13px}
+  .brand small{font-size:9px}
+  .navlabel,.sidebottom{display:none}
+  .nav{display:flex;overflow-x:auto;gap:4px;padding:2px 0}
+  .nav button{min-height:36px;flex:none;padding:7px 10px;background:transparent}
+  .nav .ico{display:none}
+  .nav .txt{display:block;white-space:nowrap}
+  .nav .txt span{font-size:10px}
+  .topbar{height:47px;padding:0 14px}
+  .content{padding:14px 12px 28px}
+  .chat-home{gap:12px}
+  .chat-intro{padding:18px 3px 2px}
+  .chat-intro h1{font-size:30px}
+  .chat-workflow{padding:15px}
+  #tracker>.pagehead>div:last-child .btn{flex:1 1 auto}
+  .application-filters{gap:6px}
+  .application-filter{font-size:10px;padding:6px 9px}
+  .application-row{padding:12px}
+}
