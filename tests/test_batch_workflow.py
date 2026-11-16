@@ -104,6 +104,7 @@ class BatchPrepareEndpointTests(unittest.TestCase):
                 kwargs = start_run.call_args.kwargs
                 self.assertEqual(kwargs["application_id"], application_id)
                 self.assertTrue(kwargs["resume_bytes"].startswith(b"PK"))
+                self.assertEqual(kwargs["approved_sensitive_answers"], {})
                 self.assertIn("Example_1", kwargs["resume_filename"])
                 self.assertTrue(kwargs["cover_letter_bytes"].startswith(b"PK"))
 

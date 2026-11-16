@@ -37,7 +37,7 @@ _ATS_HOSTS = (
     "greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", "workable.com",
     "myworkdayjobs.com", "workday.com", "icims.com", "jobvite.com", "successfactors.com",
     "taleo.net", "oraclecloud.com", "dayforcehcm.com", "paylocity.com", "bamboohr.com",
-    "recruitee.com", "breezy.hr", "jazz.co", "personio.com", "personio.de", "jobscore.com",
+    "recruitee.com", "breezy.hr", "jazz.co", "personio.com", "personio.de", "jobscore.com", "workatastartup.com",
 )
 
 _SENSITIVE_LABEL = re.compile(
@@ -98,7 +98,33 @@ def _field_value(descriptor: dict[str, Any], profile: dict[str, Any]) -> tuple[s
     """Return (value, source key) only for high-confidence profile matches."""
     label = " ".join(str(descriptor.get(key) or "") for key in ("label", "name", "placeholder", "autocomplete", "id"))
     label = re.sub(r"[_-]+", " ", label).casefold().strip()
-    if not label or _SENSITIVE_LABEL.search(label):
+    if not label:
+        return None
+
+    approved_sensitive_answers = descriptor.get("_approved_sensitive_answers") or {}
+    if isinstance(approved_sensitive_answers, dict):
+        authorization = str(approved_sensitive_answers.get("us_work_authorized") or "").strip()
+        sponsorship = str(approved_sensitive_answers.get("us_visa_sponsorship") or "").strip()
+        answer = None
+        source = ""
+        if authorization and re.search(r"\b(legally )?authorized to work|work authorization in the united states|eligible to work in the united states\b", label, re.I):
+            answer, source = authorization, "work_authorization"
+        elif sponsorship and re.search(r"\b(require|need|requiring|requiring future)\b.{0,80}\b(sponsorship|visa|h.?1b)\b|\b(sponsorship|visa sponsorship)\b", label, re.I):
+            answer, source = sponsorship, "sponsorship_preferences"
+        if answer:
+            field_type = str(descriptor.get("type") or "").casefold()
+            if field_type == "radio":
+                option = str(descriptor.get("optionValue") or descriptor.get("optionLabel") or "").strip()
+                if option.casefold() == answer.casefold():
+                    return answer, source
+                return None
+            if field_type == "select":
+                options = descriptor.get("options") or []
+                if any(str(option.get("label") or "").strip().casefold() == answer.casefold() or str(option.get("value") or "").strip().casefold() == answer.casefold() for option in options if isinstance(option, dict)):
+                    return answer, source
+                return None
+
+    if _SENSITIVE_LABEL.search(label):
         return None
 
     def value(key: str, transform=lambda item: str(item or "").strip()):
@@ -132,6 +158,11 @@ def _field_value(descriptor: dict[str, Any], profile: dict[str, Any]) -> tuple[s
         return value("address_line2")
     if auto == "address-level2" or re.search(r"\b(city|town)\b", label):
         return value("city")
+    if re.search(r"\b(current )?location\b", label):
+        location = str(profile.get("location") or "").strip() or ", ".join(
+            str(profile.get(key) or "").strip() for key in ("city", "state") if str(profile.get(key) or "").strip()
+        )
+        return (location, "location") if location else None
     if auto == "address-level1" or re.search(r"\b(state|province|region)\b", label):
         return value("state")
     if auto == "postal-code" or re.search(r"\b(zip(?: code)?|postal code)\b", label):
@@ -471,7 +502,10 @@ def _mcp_page_state(client: _ChromeDevtoolsClient, page_id: int) -> dict[str, An
             label: labelsFor(el), name: el.getAttribute('name') || '', id: el.id || '',
             placeholder: el.getAttribute('placeholder') || '', autocomplete: el.getAttribute('autocomplete') || '',
             required: !!el.required || el.getAttribute('aria-required') === 'true',
-            disabled: !!el.disabled || !!el.readOnly, value: el.value || '',
+            disabled: !!el.disabled || !!el.readOnly, value: ['radio', 'checkbox'].includes((el.type || '').toLowerCase()) ? '' : (el.value || ''),
+            checked: ['radio', 'checkbox'].includes((el.type || '').toLowerCase()) ? !!el.checked : false,
+            optionValue: ['radio', 'checkbox'].includes((el.type || '').toLowerCase()) ? (el.value || '') : '',
+            optionLabel: ['radio', 'checkbox'].includes((el.type || '').toLowerCase()) ? clean(Array.from(el.labels || []).map(node => node.innerText || node.textContent).join(' ')) : '',
             options: el.tagName === 'SELECT' ? Array.from(el.options).map(option => ({label: clean(option.textContent), value: option.value})) : []
           }));
           const files = Array.from(document.querySelectorAll('input[type=file]')).map((el, index) => ({
@@ -481,7 +515,7 @@ def _mcp_page_state(client: _ChromeDevtoolsClient, page_id: int) -> dict[str, An
           const links = Array.from(document.querySelectorAll('a[href]')).map(el => ({
             text: clean(el.innerText || el.getAttribute('aria-label')), href: el.href,
             visible: visible(el), inForm: !!el.closest('form')
-          })).filter(el => el.visible && !el.inForm && /^(apply|apply now|apply online|apply for this job|apply to this job|start application)$/i.test(el.text));
+          })).filter(el => el.visible && !el.inForm && /^(apply|apply now|apply online|apply for this job|apply to this job|apply to role|start application)$/i.test(el.text.replace(/[›>↗]+$/g, '').trim()));
           return {url: location.href, title: document.title, text: clean(document.body?.innerText).slice(0, 18000),
             passwordCount: document.querySelectorAll('input[type=password]').length, fields, files, links};
         }""",
@@ -501,7 +535,16 @@ def _mcp_apply_operations(client: _ChromeDevtoolsClient, page_id: int, operation
       const completed = [];
       for (const operation of operations) {
         const element = controls[operation.index];
-        if (!element || element.disabled || element.readOnly || !element.getClientRects().length || String(element.value || '').trim()) continue;
+        if (!element || element.disabled || element.readOnly || !element.getClientRects().length) continue;
+        if (element.type === 'radio') {
+          if (element.checked || String(element.value || '').trim().toLowerCase() !== String(operation.value || '').trim().toLowerCase()) continue;
+          element.checked = true;
+          element.dispatchEvent(new Event('input', {bubbles: true}));
+          element.dispatchEvent(new Event('change', {bubbles: true}));
+          completed.push(operation.index);
+          continue;
+        }
+        if (String(element.value || '').trim()) continue;
         let value = operation.value;
         if (element.tagName === 'SELECT') {
           const target = element.options.find(option => option.label.trim().toLowerCase() === String(value).trim().toLowerCase() || option.value.trim().toLowerCase() === String(value).trim().toLowerCase());
@@ -536,6 +579,44 @@ def _flatten_accessibility_nodes(value: Any) -> list[dict[str, Any]]:
     return found
 
 
+def _is_generic_yc_apply_url(value: str) -> bool:
+    parsed = urlsplit(value)
+    return (parsed.hostname or "").casefold() in {"ycombinator.com", "www.ycombinator.com"} and parsed.path.rstrip("/").casefold() == "/apply"
+
+
+def _looks_like_sign_in(state: dict[str, Any]) -> bool:
+    url = str(state.get("url") or "").casefold()
+    title = str(state.get("title") or "").casefold()
+    return bool(state.get("passwordCount")) or any(term in url for term in ("/login", "sign-in", "signin")) or any(term in title for term in ("sign in", "log in", "login"))
+
+
+def _yc_application_page_candidates(pages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Find a Y Combinator role application/profile page after its auth redirect."""
+    candidates = []
+    for item in pages:
+        parsed = urlsplit(str(item.get("url") or ""))
+        host = (parsed.hostname or "").casefold()
+        if host == "account.ycombinator.com" and parsed.path.casefold().startswith("/authenticate"):
+            candidates.append(item)
+        elif host == "www.workatastartup.com" and parsed.path.casefold().startswith("/application/"):
+            candidates.append(item)
+        elif host == "workatastartup.com" and parsed.path.casefold().startswith("/application/"):
+            candidates.append(item)
+    return candidates
+
+
+def _resolve_application_page(client: _ChromeDevtoolsClient, page_id: int, posting_url: str) -> dict[str, Any] | None:
+    pages = _mcp_pages(client.tool("list_pages"))
+    page = next((item for item in pages if int(item.get("id", -1)) == int(page_id)), None)
+    if page:
+        return page
+    if (urlsplit(posting_url).hostname or "").casefold().endswith("ycombinator.com"):
+        candidates = _yc_application_page_candidates(pages)
+        if len(candidates) == 1:
+            return candidates[0]
+    return None
+
+
 def _upload_uid(client: _ChromeDevtoolsClient, page_id: int, target_label: str) -> str | None:
     snapshot = client.tool("take_snapshot", {"pageId": page_id, "verbose": True})
     structured = snapshot.get("structuredContent") or {}
@@ -553,55 +634,80 @@ def _upload_uid(client: _ChromeDevtoolsClient, page_id: int, target_label: str) 
 
 
 def _fill_connected_chrome_page(client: _ChromeDevtoolsClient, page_id: int, payload: dict[str, Any]) -> dict[str, Any]:
-    pages_response = client.tool("list_pages")
-    page = next((item for item in _mcp_pages(pages_response) if int(item.get("id", -1)) == int(page_id)), None)
+    page = _resolve_application_page(client, page_id, str(payload["url"]))
     if not page:
-        raise RuntimeError("The application tab is no longer available in Chrome. Prepare the role again to reopen it.")
+        return {"status": "needs_manual_navigation", "filled": [], "uploaded": [], "needs_user": ["Open the Epsilab Work at a Startup profile in Chrome, then choose Fill open form."], "message": "The YC application moved to another tab. Open its profile step in your regular Chrome, then continue here."}
+    page_id = int(page["id"])
     page_url = str(page.get("url") or "")
     posting_url = str(payload["url"])
     if not is_public_https_url(page_url) or not _allowed_application_host(posting_url, page_url):
         return {"status": "unrecognized_portal", "filled": [], "uploaded": [], "needs_user": ["Review the employer portal host before entering personal details."], "message": "The page is on a different or unrecognized site. Neural Ant left your profile and résumé unshared."}
 
     state = _mcp_page_state(client, page_id)
+    if "/authenticate" in str(state.get("url") or "").casefold() and not state.get("passwordCount"):
+        for _ in range(5):
+            time.sleep(0.5)
+            page = _resolve_application_page(client, page_id, posting_url)
+            if page:
+                page_id = int(page["id"])
+                page_url = str(page.get("url") or page_url)
+                state = _mcp_page_state(client, page_id)
+                if "/authenticate" not in str(state.get("url") or "").casefold() or _looks_like_sign_in(state):
+                    break
     page_text = (str(state.get("url", "")) + " " + str(state.get("title", ""))).casefold()
-    if state.get("passwordCount") or any(term in page_text for term in ("/login", "sign-in", "signin", "log in", "login")):
-        return {"status": "sign_in_required", "filled": [], "uploaded": [], "needs_user": ["Sign in to the employer portal in your regular Chrome window, then continue here."], "message": "Sign in using your existing Chrome session, then continue here."}
+    if _looks_like_sign_in(state) or _is_generic_yc_apply_url(page_url):
+        if _is_generic_yc_apply_url(page_url):
+            return {"status": "needs_manual_navigation", "filled": [], "uploaded": [], "needs_user": ["Open the Epsilab role application, not Y Combinator's generic Apply page."], "message": "This is Y Combinator's generic Apply page, not the Epsilab application. Neural Ant left the form untouched."}
+        return {"status": "sign_in_required", "filled": [], "uploaded": [], "needs_user": ["Sign in to the employer portal in your regular Chrome window, then continue here."], "message": "Sign in using your existing Chrome session, then continue here.", "_page_id": page_id}
 
     fields = [item for item in state.get("fields", []) if isinstance(item, dict)]
     files = [item for item in state.get("files", []) if isinstance(item, dict)]
+    approved_sensitive_answers = payload.get("approved_sensitive_answers") or {}
     application_form_found = bool(files) or any(
-        item.get("visible") and _field_value(item, payload["profile"]) is not None
+        item.get("visible") and _field_value({**item, "_approved_sensitive_answers": approved_sensitive_answers}, payload["profile"]) is not None
         for item in fields
     )
     if not application_form_found:
-        links = [item for item in state.get("links", []) if isinstance(item, dict)]
+        links = [item for item in state.get("links", []) if isinstance(item, dict) and not _is_generic_yc_apply_url(str(item.get("href") or ""))]
         if len(links) != 1:
             return {"status": "needs_manual_navigation", "filled": [], "uploaded": [], "needs_user": ["Open the application form in Chrome, then choose Continue here."], "message": "Neural Ant did not find one direct Apply link. Open the form in your regular Chrome window, then continue here."}
         destination = str(links[0].get("href") or "")
         if not is_public_https_url(destination) or not _allowed_application_host(page_url, destination):
             return {"status": "unrecognized_portal", "filled": [], "uploaded": [], "needs_user": ["Review the Apply link destination in Chrome."], "message": "The Apply link opens an unrecognized site. Neural Ant left your profile and résumé unshared."}
         client.tool("navigate_page", {"pageId": page_id, "type": "url", "url": destination, "timeout": 30000}, timeout=35)
-        pages_response = client.tool("list_pages")
-        page = next((item for item in _mcp_pages(pages_response) if int(item.get("id", -1)) == int(page_id)), None)
+        page = _resolve_application_page(client, page_id, posting_url)
+        if page:
+            page_id = int(page["id"])
         page_url = str(page.get("url") or "") if page else ""
         if not is_public_https_url(page_url) or not _allowed_application_host(destination, page_url):
             return {"status": "unrecognized_portal", "filled": [], "uploaded": [], "needs_user": ["Review the redirected employer portal in Chrome."], "message": "The Apply link redirected to an unrecognized site. Neural Ant left your profile and résumé unshared."}
         state = _mcp_page_state(client, page_id)
-        if state.get("passwordCount") or any(term in str(state.get("url", "")).casefold() for term in ("/login", "sign-in", "signin", "login")):
-            return {"status": "sign_in_required", "filled": [], "uploaded": [], "needs_user": ["Sign in to the employer portal in your regular Chrome window, then continue here."], "message": "Sign in using your existing Chrome session, then continue here."}
+        if "/authenticate" in str(state.get("url") or "").casefold() and not state.get("passwordCount"):
+            for _ in range(5):
+                time.sleep(0.5)
+                page = _resolve_application_page(client, page_id, posting_url)
+                if page:
+                    page_id = int(page["id"])
+                    page_url = str(page.get("url") or page_url)
+                    state = _mcp_page_state(client, page_id)
+                    if "/authenticate" not in str(state.get("url") or "").casefold() or _looks_like_sign_in(state):
+                        break
+        if _looks_like_sign_in(state):
+            return {"status": "sign_in_required", "filled": [], "uploaded": [], "needs_user": ["Sign in to the employer portal in your regular Chrome window, then continue here."], "message": "Sign in using your existing Chrome session, then continue here.", "_page_id": page_id}
         fields = [item for item in state.get("fields", []) if isinstance(item, dict)]
         files = [item for item in state.get("files", []) if isinstance(item, dict)]
 
     operations = []
     labels_by_index: dict[int, str] = {}
     needs_user: list[str] = []
-    controls_to_skip = {"hidden", "password", "checkbox", "radio", "submit", "button", "reset", "image", "file"}
+    controls_to_skip = {"hidden", "password", "checkbox", "submit", "button", "reset", "image", "file"}
     for item in fields:
         if not item.get("visible") or item.get("disabled"):
             continue
         label = str(item.get("label") or "").strip()
-        match = _field_value(item, payload["profile"])
-        if match and not str(item.get("value") or "").strip() and str(item.get("type") or "").casefold() not in controls_to_skip:
+        descriptor = {**item, "_approved_sensitive_answers": approved_sensitive_answers}
+        match = _field_value(descriptor, payload["profile"])
+        if match and not str(item.get("value") or "").strip() and not item.get("checked") and str(item.get("type") or "").casefold() not in controls_to_skip:
             value, source = match
             if item.get("tag") == "select":
                 options = item.get("options") or []
@@ -616,6 +722,12 @@ def _fill_connected_chrome_page(client: _ChromeDevtoolsClient, page_id: int, pay
                 operations.append({"index": index, "value": value})
                 labels_by_index[index] = (label or source)[:80]
         elif item.get("required") and label:
+            recognized_approved_radio = str(item.get("type") or "").casefold() == "radio" and (
+                (approved_sensitive_answers.get("us_work_authorized") and re.search(r"\b(legally )?authorized to work|work authorization in the united states|eligible to work in the united states\b", label, re.I))
+                or (approved_sensitive_answers.get("us_visa_sponsorship") and re.search(r"\b(require|need|requiring|requiring future)\b.{0,80}\b(sponsorship|visa|h.?1b)\b|\b(sponsorship|visa sponsorship)\b", label, re.I))
+            )
+            if recognized_approved_radio:
+                continue
             needs_user.append("Review required field: " + label[:120])
 
     completed = _mcp_apply_operations(client, page_id, operations)
@@ -651,12 +763,15 @@ def _fill_connected_chrome_page(client: _ChromeDevtoolsClient, page_id: int, pay
     human_check = any(term in all_text for term in ("captcha", "i'm not a robot", "verify you are human", "human verification", "security check"))
     if human_check:
         needs_user.append("Complete the human verification in Chrome.")
+    if not filled and not uploaded:
+        return {"status": "needs_manual_navigation", "filled": [], "uploaded": [], "needs_user": list(dict.fromkeys(needs_user or ["Neural Ant could not confirm any completed form fields or résumé upload."])), "message": "Neural Ant did not confirm that any application fields or résumé were filled. The form remains open for review.", "_page_id": page_id}
     return {
         "status": "human_verification_required" if human_check else "ready",
         "filled": filled,
         "uploaded": uploaded,
         "needs_user": list(dict.fromkeys(needs_user)),
         "message": "Review the open application in your regular Chrome window. Neural Ant will not submit it.",
+        "_page_id": page_id,
     }
 
 
@@ -738,6 +853,10 @@ def _worker_main() -> None:
 
                 _set_run(run_id, status="opening", message="Checking the employer form in your regular Chrome.")
                 result = _fill_connected_chrome_page(client, page_id, payload)
+                resolved_page_id = result.pop("_page_id", None)
+                if resolved_page_id is not None:
+                    page_id = int(resolved_page_id)
+                    pages[run_id] = page_id
                 page_response = client.tool("list_pages")
                 current = next((item for item in _mcp_pages(page_response) if int(item.get("id", -1)) == page_id), {})
                 page_url = str(current.get("url") or result.get("url") or payload["url"])
@@ -779,7 +898,7 @@ def shutdown_portal_browser_worker() -> None:
         _WORKER.join(timeout=8)
 
 
-def start_portal_run(*, application_id: int, job: Any, profile: dict[str, Any], resume_bytes: bytes, resume_filename: str, cover_letter_bytes: bytes = b"", cover_letter_filename: str = "") -> dict[str, Any]:
+def start_portal_run(*, application_id: int, job: Any, profile: dict[str, Any], resume_bytes: bytes, resume_filename: str, cover_letter_bytes: bytes = b"", cover_letter_filename: str = "", approved_sensitive_answers: dict[str, str] | None = None) -> dict[str, Any]:
     """Stage generated files locally and enqueue a visible Chrome form handoff."""
     run_id = uuid.uuid4().hex
     temp_dir = Path(tempfile.mkdtemp(prefix="neural-ant-portal-"))
@@ -826,6 +945,7 @@ def start_portal_run(*, application_id: int, job: Any, profile: dict[str, Any], 
     payload = {
         "url": str(job.url or ""),
         "profile": json.loads(json.dumps(profile)),
+        "approved_sensitive_answers": json.loads(json.dumps(approved_sensitive_answers or {})),
         "resume_path": str(resume_path),
         "cover_letter_path": cover_path,
         "temp_dir": str(temp_dir),

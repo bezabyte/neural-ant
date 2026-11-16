@@ -2813,6 +2813,15 @@ def prepare_application_portal(
     if draft.cover_letter:
         cover_letter_bytes = build_cover_letter_docx(profile, job, draft.cover_letter)
         cover_letter_name = resume_name.removesuffix("_Resume.docx") + "_Cover_Letter.docx"
+    # The user explicitly approved these two truthful yes/no answers for the
+    # Epsilab application only. Keep that consent scoped to this exact role;
+    # every other employer's immigration questions remain for manual review.
+    approved_sensitive_answers = {}
+    if (
+        (urlsplit(job.url).hostname or "").casefold() == "www.ycombinator.com"
+        and urlsplit(job.url).path.casefold().rstrip("/") == "/companies/epsilab-com/jobs/pqlmcn4-member-of-technical-staff-research-engineer-reinforcement-learning"
+    ):
+        approved_sensitive_answers = {"us_work_authorized": "Yes", "us_visa_sponsorship": "Yes"}
     return start_portal_run(
         application_id=application.id,
         job=job,
@@ -2821,6 +2830,7 @@ def prepare_application_portal(
         resume_filename=resume_name,
         cover_letter_bytes=cover_letter_bytes,
         cover_letter_filename=cover_letter_name,
+        approved_sensitive_answers=approved_sensitive_answers,
     )
 
 
@@ -3159,7 +3169,7 @@ def deterministic_tailor(resume_text: str, job: JobRow, profile: dict[str, Any])
         "\n\n## Manual checks before submission\n\n"
         "- Confirm every selected line is still accurate and complete.\n"
         "- Confirm the posting's work authorization, sponsorship, location, and employment type yourself.\n"
-        "- Attach the downloaded resume yourself; Neural Ant does not upload or submit applications.\n"
+        "- For supported portals, Prepare to apply opens the form in your regular Chrome, attaches the tailored resume when the upload control is recognized, and fills matching saved facts. Review every entry and complete any flagged questions yourself. Neural Ant leaves final submission to you.\n"
     )
 
 
