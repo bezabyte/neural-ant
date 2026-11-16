@@ -12,7 +12,7 @@ import os
 import re
 import secrets
 import smtplib
-from threading import Event, Thread
+from threading import Event, Lock, Thread
 from time import perf_counter
 from types import SimpleNamespace
 import uuid
@@ -40,6 +40,31 @@ from api.docx_export import build_cover_letter_docx, build_resume_docx
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 log = logging.getLogger("neural-ant")
+
+_http_client: httpx.Client | None = None
+_http_client_lock = Lock()
+
+
+def get_http_client() -> httpx.Client:
+    """Reuse a bounded connection pool across independent outbound requests."""
+    global _http_client
+    with _http_client_lock:
+        if _http_client is None or _http_client.is_closed:
+            _http_client = httpx.Client(
+                timeout=httpx.Timeout(20.0, connect=5.0),
+                follow_redirects=True,
+                headers={"User-Agent": "NeuralAnt/1.0 job-search"},
+                limits=httpx.Limits(max_connections=24, max_keepalive_connections=12, keepalive_expiry=30.0),
+            )
+        return _http_client
+
+
+def close_http_client() -> None:
+    global _http_client
+    with _http_client_lock:
+        client, _http_client = _http_client, None
+    if client is not None and not client.is_closed:
+        client.close()
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data/neural_ant.db")
 if DATABASE_URL.startswith("postgres://"):
@@ -840,6 +865,29 @@ def sponsor_for(db: Session, company: str) -> SponsorRow | None:
     return db.scalar(select(SponsorRow).where(SponsorRow.company_key == key).order_by(SponsorRow.imported_at.desc()))
 
 
+def latest_sponsor_index(db: Session, company_names: list[str]) -> dict[str, SponsorRow]:
+    """Load relevant sponsorship evidence in bounded batches, not per listing."""
+    latest: dict[str, SponsorRow] = {}
+    keys = list(dict.fromkeys(company_key(str(name).strip()) for name in company_names if str(name).strip()))
+    for offset in range(0, len(keys), 500):
+        batch = keys[offset:offset + 500]
+        rows = db.scalars(select(SponsorRow).where(SponsorRow.company_key.in_(batch)).order_by(SponsorRow.imported_at.desc())).all()
+        for row in rows:
+            latest.setdefault(row.company_key, row)
+    return latest
+
+
+def jobs_by_url(db: Session, urls: list[str]) -> dict[str, JobRow]:
+    """Bulk-load existing listings in bounded IN queries (SQLite-safe)."""
+    unique_urls = list(dict.fromkeys(urls))
+    found: dict[str, JobRow] = {}
+    for offset in range(0, len(unique_urls), 500):
+        batch = unique_urls[offset:offset + 500]
+        for row in db.scalars(select(JobRow).where(JobRow.url.in_(batch))).all():
+            found[row.url] = row
+    return found
+
+
 TECH_SKILL_TERMS = (
     "Python", "Java", "Go", "TypeScript", "JavaScript", "SQL", "AWS", "Azure", "GCP", "Terraform",
     "Docker", "Kubernetes", "FastAPI", "Django", "Flask", "React", "PostgreSQL", "MongoDB", "Redis",
@@ -1085,7 +1133,9 @@ def detect_sponsorship(description: str) -> tuple[str, str]:
 
 
 def refresh_job_scores(db: Session, profile: dict[str, Any]) -> None:
-    for job in db.scalars(select(JobRow)).all():
+    jobs = db.scalars(select(JobRow)).all()
+    sponsors = latest_sponsor_index(db, [job.company_name for job in jobs])
+    for job in jobs:
         raw = {
             "title": job.title,
             "description": job.description,
@@ -1095,7 +1145,7 @@ def refresh_job_scores(db: Session, profile: dict[str, Any]) -> None:
             "salary_text": job.salary_text,
             "url": job.url,
         }
-        fit, reasons, breakdown, status, evidence, evidence_url = score_job(raw, profile, sponsor_for(db, job.company_name))
+        fit, reasons, breakdown, status, evidence, evidence_url = score_job(raw, profile, sponsors.get(company_key(job.company_name)))
         experience_note = re.search(r"Experience stated in supplied role notes:\s*(.+)", job.description or "")
         if experience_note:
             reasons.append(f"Role experience stated: {experience_note.group(1).splitlines()[0].strip()}")
@@ -1182,14 +1232,17 @@ def queue_qualified_jobs_for_review(db: Session, profile: dict[str, Any]) -> int
 
 
 def run_search(db: Session, *, send_alerts: bool = True, days: int = 14) -> dict[str, Any]:
+    started = perf_counter()
     profile = ensure_profile(db).data or DEFAULT_PROFILE
     sources = db.scalars(select(SourceRow).where(SourceRow.enabled.is_(True))).all()
     result = {"sources_checked": 0, "jobs_seen": 0, "jobs_stale": 0, "jobs_saved": 0, "new_matches": 0, "review_queue_added": 0, "alerts_sent": 0, "source_errors": [], "source_status": []}
     if not sources:
         result["message"] = "Add a supported employer board or public job API source to begin searching."
+        persist_started = perf_counter()
         result["review_queue_added"] = queue_qualified_jobs_for_review(db, profile)
         if result["review_queue_added"]:
             db.commit()
+        result["timings_ms"] = {"fetch": 0, "persist_and_score": round((perf_counter() - persist_started) * 1000), "total": round((perf_counter() - started) * 1000)}
         return result
     adapters = {
         "greenhouse": parse_greenhouse, "lever": parse_lever, "ashby": parse_ashby,
@@ -1197,20 +1250,43 @@ def run_search(db: Session, *, send_alerts: bool = True, days: int = 14) -> dict
     }
     source_specs = [(source.id, source.ats_type, source.slug, source.company_name) for source in sources]
 
-    def fetch_source(spec: tuple[int, str, str, str]) -> tuple[int, list[dict[str, Any]], str | None]:
+    # Fetch independent public boards together, then write their results through
+    # the single SQLAlchemy session below. This avoids N sequential timeouts and
+    # keeps network waits outside SQLite's write transaction.
+    fetch_started = perf_counter()
+    client = get_http_client()
+
+    def fetch_with_shared_client(spec: tuple[int, str, str, str]) -> tuple[int, list[dict[str, Any]], str | None]:
         source_id, ats_type, slug, company_name = spec
         try:
-            with httpx.Client(timeout=20, follow_redirects=True, headers={"User-Agent": "NeuralAnt/1.0 job-search"}) as client:
-                rows = adapters[ats_type](slug, company_name, client)
+            rows = adapters[ats_type](slug, company_name, client)
             return source_id, rows, None
         except Exception as exc:
             return source_id, [], exc.__class__.__name__
 
-    # Fetch independent public boards together, then write their results through
-    # the single SQLAlchemy session below. This avoids N sequential timeouts and
-    # keeps network waits outside SQLite's write transaction.
     with ThreadPoolExecutor(max_workers=min(6, len(source_specs))) as executor:
-        fetched_sources = {source_id: (rows, error) for source_id, rows, error in executor.map(fetch_source, source_specs)}
+        fetched_sources = {source_id: (rows, error) for source_id, rows, error in executor.map(fetch_with_shared_client, source_specs)}
+    fetch_ms = round((perf_counter() - fetch_started) * 1000)
+
+    persist_started = perf_counter()
+    candidate_urls = []
+    candidate_companies = []
+    source_names = {source.id: source.company_name for source in sources}
+    for source_id, (rows, fetch_error) in fetched_sources.items():
+        if fetch_error:
+            continue
+        for raw in rows:
+            url = canonical_job_url(str(raw.get("url", "")).strip())
+            title = str(raw.get("title", "")).strip()
+            if not url.startswith("https://") or not title:
+                continue
+            published = parse_posted_date(raw.get("posted_at"))
+            if days > 0 and published and published < date.today() - timedelta(days=days):
+                continue
+            candidate_urls.append(url)
+            candidate_companies.append(str(raw.get("company") or source_names[source_id]).strip()[:255])
+    existing_by_url = jobs_by_url(db, candidate_urls)
+    sponsors_by_company = latest_sponsor_index(db, candidate_companies)
 
     for source in sources:
         result["sources_checked"] += 1
@@ -1234,9 +1310,9 @@ def run_search(db: Session, *, send_alerts: bool = True, days: int = 14) -> dict
                 stale_rows += 1
                 result["jobs_stale"] += 1
                 continue
-            existing = db.scalar(select(JobRow).where(JobRow.url == url))
+            existing = existing_by_url.get(url)
             job_company = str(raw.get("company") or source.company_name).strip()[:255]
-            sponsor = sponsor_for(db, job_company)
+            sponsor = sponsors_by_company.get(company_key(job_company))
             fit, reasons, breakdown, status, evidence, evidence_url = score_job(raw, profile, sponsor)
             salary_min, salary_max = parse_salary(raw.get("salary_text", ""))
             if existing:
@@ -1264,7 +1340,9 @@ def run_search(db: Session, *, send_alerts: bool = True, days: int = 14) -> dict
                     db.add(job)
                     db.flush()
             except IntegrityError:
+                existing_by_url[url] = db.scalar(select(JobRow).where(JobRow.url == url))
                 continue
+            existing_by_url[url] = job
             result["jobs_saved"] += 1
             if fit >= int(profile.get("match_threshold") or 50):
                 result["new_matches"] += 1
@@ -1284,6 +1362,7 @@ def run_search(db: Session, *, send_alerts: bool = True, days: int = 14) -> dict
         })
     result["review_queue_added"] = queue_qualified_jobs_for_review(db, profile)
     db.commit()
+    result["timings_ms"] = {"fetch": fetch_ms, "persist_and_score": round((perf_counter() - persist_started) * 1000), "total": round((perf_counter() - started) * 1000)}
     return result
 
 
@@ -1640,11 +1719,15 @@ def automatic_search_loop() -> None:
 @app.on_event("shutdown")
 def stop_automatic_search() -> None:
     global _search_thread
-    if _search_thread is None:
-        return
-    _search_stop.set()
-    _search_thread.join(timeout=5)
-    _search_thread = None
+    if _search_thread is not None:
+        _search_stop.set()
+        thread = _search_thread
+        thread.join(timeout=5)
+        if thread.is_alive():
+            log.warning("Automatic search is still finishing; leaving its shared HTTP client open until process exit.")
+            return
+        _search_thread = None
+    close_http_client()
 
 
 @app.get("/api/health")
@@ -2069,6 +2152,7 @@ def freehire_salary(enrichment: dict[str, Any]) -> str:
 @app.post("/api/search/freehire")
 def search_freehire(body: FreehireSearchBody, _: None = Depends(require_auth), db: Session = Depends(get_db)):
     """Search Freehire's public tech index; only the query and filters leave this app."""
+    started = perf_counter()
     profile = ensure_profile(db).data or DEFAULT_PROFILE
     query = body.query.strip() or freehire_profile_query(profile)
     if not query:
@@ -2085,9 +2169,10 @@ def search_freehire(body: FreehireSearchBody, _: None = Depends(require_auth), d
     }
     if body.days:
         params["posted_within_days"] = str(body.days)
-    client = httpx.Client(timeout=30, follow_redirects=True, headers={"User-Agent": "NeuralAnt/1.0 job-search", "Accept": "application/json"})
+    client = get_http_client()
+    fetch_started = perf_counter()
     try:
-        response = client.get(f"{FREEHIRE_API_URL}/api/v1/agent/jobs/search", params=params)
+        response = client.get(f"{FREEHIRE_API_URL}/api/v1/agent/jobs/search", params=params, headers={"Accept": "application/json"}, timeout=httpx.Timeout(30.0, connect=5.0))
         if response.status_code == 404:
             raise HTTPException(status_code=502, detail="The Freehire search endpoint is unavailable. Try again later or use a configured employer board.")
         response.raise_for_status()
@@ -2100,11 +2185,19 @@ def search_freehire(body: FreehireSearchBody, _: None = Depends(require_auth), d
     except (httpx.HTTPError, ValueError) as exc:
         log.warning("Freehire search failed: %s", exc.__class__.__name__)
         raise HTTPException(status_code=502, detail="The public job index could not complete this search. Try again shortly.") from exc
-    finally:
-        client.close()
+    fetch_ms = round((perf_counter() - fetch_started) * 1000)
 
     counts = {"jobs_seen": 0, "jobs_saved": 0, "new_matches": 0, "alerts_sent": 0}
     now = datetime.now(timezone.utc)
+    persist_started = perf_counter()
+    candidate_items = [
+        (canonical_job_url(str(item.get("url") or "").strip()), str(item.get("company") or "Unknown employer").strip()[:255])
+        for item in rows
+        if isinstance(item, dict) and str(item.get("title") or "").strip()
+    ]
+    candidate_urls = [url for url, _company in candidate_items if url.startswith("https://")]
+    existing_by_url = jobs_by_url(db, candidate_urls)
+    sponsors_by_company = latest_sponsor_index(db, [company for url, company in candidate_items if url.startswith("https://")])
     for item in rows:
         if not isinstance(item, dict):
             continue
@@ -2126,9 +2219,9 @@ def search_freehire(body: FreehireSearchBody, _: None = Depends(require_auth), d
             "location": location, "work_mode": work_mode, "employment_type": employment,
             "salary_text": salary_text, "posted_at": str(item.get("posted_at") or ""), "source": "Freehire",
         }
-        fit, reasons, breakdown, status, evidence, evidence_url = score_job(raw, profile, sponsor_for(db, company))
+        fit, reasons, breakdown, status, evidence, evidence_url = score_job(raw, profile, sponsors_by_company.get(company_key(company)))
         salary_min, salary_max = parse_salary(salary_text)
-        existing = db.scalar(select(JobRow).where(JobRow.url == url))
+        existing = existing_by_url.get(url)
         is_new = existing is None
         if is_new:
             job = JobRow(
@@ -2145,7 +2238,9 @@ def search_freehire(body: FreehireSearchBody, _: None = Depends(require_auth), d
                     db.add(job)
                     db.flush()
             except IntegrityError:
+                existing_by_url[url] = db.scalar(select(JobRow).where(JobRow.url == url))
                 continue
+            existing_by_url[url] = job
             counts["jobs_saved"] += 1
         else:
             job = existing
@@ -2184,6 +2279,7 @@ def search_freehire(body: FreehireSearchBody, _: None = Depends(require_auth), d
     return {
         "source": "Freehire", "query": query, "index_total": meta.get("total", counts["jobs_seen"]),
         "jobs_returned": len(rows), "review_queue_added": queue_added, **counts,
+        "timings_ms": {"fetch": fetch_ms, "persist_and_score": round((perf_counter() - persist_started) * 1000), "total": round((perf_counter() - started) * 1000)},
     }
 
 
@@ -2916,7 +3012,7 @@ def configured_ai_chat(system: str, prompt: str, temperature: float = 0.2) -> tu
         raise HTTPException(status_code=503, detail="External AI is not configured. Set OPENAI_API_KEY and OPENAI_MODEL, or use the local draft option.")
     base_url = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/")
     try:
-        response = httpx.post(
+        response = get_http_client().post(
             f"{base_url}/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
             json={"model": model, "temperature": temperature, "messages": [{"role": "system", "content": system}, {"role": "user", "content": prompt}]},

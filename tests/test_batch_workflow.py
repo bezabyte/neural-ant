@@ -16,7 +16,7 @@ os.environ["UPLOAD_DIR"] = os.path.join(_test_storage.name, "resumes")
 os.environ["SEARCH_INTERVAL_SECONDS"] = "0"
 
 import httpx
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, event, func, select
 
 from api import main as appmod
 
@@ -28,6 +28,7 @@ class BatchPrepareEndpointTests(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
+        appmod.close_http_client()
         appmod.engine.dispose()
         _test_storage.cleanup()
 
@@ -165,6 +166,141 @@ class BatchPrepareEndpointTests(unittest.TestCase):
         self.assertEqual(sequential.status_code, 200, sequential.text)
         self.assertEqual(sequential.json()["max_concurrency"], 1)
         self.assertEqual(sequential_peak, 1)
+
+    def test_board_refresh_bulk_loads_existing_jobs_and_sponsor_evidence(self):
+        fixtures = [
+            {
+                "company": f"Performance Fixture {number}",
+                "title": "AI Engineer",
+                "url": f"https://example.invalid/perf/{number}",
+                "description": "Build Python services and reliable AI products.",
+                "location": "Remote, US",
+                "work_mode": "Remote",
+                "source": "test-fixture",
+            }
+            for number in range(40)
+        ]
+        with appmod.SessionLocal() as db:
+            db.execute(delete(appmod.SourceRow))
+            db.execute(delete(appmod.SponsorRow))
+            db.add(appmod.SourceRow(ats_type="greenhouse", slug="fixture", company_name="Performance Fixture"))
+            db.add(appmod.SponsorRow(
+                company_key=appmod.company_key("Performance Fixture"),
+                company_name="Performance Fixture",
+                evidence_url="https://example.invalid/sponsor",
+                evidence_year="2026",
+                filing_count=1,
+            ))
+            db.commit()
+
+        counts = {"sponsor_selects": 0, "url_equality_selects": 0, "url_batch_selects": 0}
+
+        def count_queries(_conn, _cursor, statement, _parameters, _context, _many):
+            sql = " ".join(statement.casefold().split())
+            if "from sponsor_evidence" in sql:
+                counts["sponsor_selects"] += 1
+            if "from jobs" in sql and "where jobs.url =" in sql:
+                counts["url_equality_selects"] += 1
+            if "from jobs" in sql and "where jobs.url in" in sql:
+                counts["url_batch_selects"] += 1
+
+        event.listen(appmod.engine, "before_cursor_execute", count_queries)
+        try:
+            with appmod.SessionLocal() as db, patch.object(appmod, "parse_greenhouse", return_value=fixtures):
+                result = appmod.run_search(db, send_alerts=False, days=14)
+            self.assertEqual(result["jobs_saved"], len(fixtures))
+            self.assertEqual(counts["sponsor_selects"], 1)
+            self.assertEqual(counts["url_equality_selects"], 0)
+            self.assertEqual(counts["url_batch_selects"], 1)
+            self.assertIn("timings_ms", result)
+        finally:
+            event.remove(appmod.engine, "before_cursor_execute", count_queries)
+            with appmod.SessionLocal() as db:
+                fixture_ids = select(appmod.JobRow.id).where(appmod.JobRow.source == "test-fixture")
+                db.execute(delete(appmod.ApplicationRow).where(appmod.ApplicationRow.job_id.in_(fixture_ids)))
+                db.execute(delete(appmod.JobRow).where(appmod.JobRow.source == "test-fixture"))
+                db.execute(delete(appmod.SourceRow).where(appmod.SourceRow.slug == "fixture"))
+                db.execute(delete(appmod.SponsorRow).where(appmod.SponsorRow.evidence_url == "https://example.invalid/sponsor"))
+                db.commit()
+
+    def test_freehire_search_bulk_loads_existing_jobs_and_sponsor_evidence(self):
+        fixtures = [
+            {
+                "company": f"Freehire Fixture {number}",
+                "title": "AI Engineer",
+                "url": f"https://example.invalid/freehire/{number}",
+                "description": "Build Python services and reliable AI products.",
+                "work_mode": "remote",
+                "enrichment": {},
+            }
+            for number in range(40)
+        ]
+
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return {"data": fixtures, "meta": {"total": len(fixtures)}}
+
+        class FakeClient:
+            @staticmethod
+            def get(*_args, **_kwargs):
+                return FakeResponse()
+
+        with appmod.SessionLocal() as db:
+            db.execute(delete(appmod.SponsorRow))
+            db.add(appmod.SponsorRow(
+                company_key=appmod.company_key("Freehire Fixture"),
+                company_name="Freehire Fixture",
+                evidence_url="https://example.invalid/freehire-sponsor",
+                evidence_year="2026",
+                filing_count=1,
+            ))
+            db.commit()
+
+        counts = {"sponsor_selects": 0, "url_equality_selects": 0, "url_batch_selects": 0}
+
+        def count_queries(_conn, _cursor, statement, _parameters, _context, _many):
+            sql = " ".join(statement.casefold().split())
+            if "from sponsor_evidence" in sql:
+                counts["sponsor_selects"] += 1
+            if "from jobs" in sql and "where jobs.url =" in sql:
+                counts["url_equality_selects"] += 1
+            if "from jobs" in sql and "where jobs.url in" in sql:
+                counts["url_batch_selects"] += 1
+
+        event.listen(appmod.engine, "before_cursor_execute", count_queries)
+        try:
+            body = appmod.FreehireSearchBody(query='title:"AI Engineer"', country="US", work_mode="remote", days=14, limit=50)
+            with appmod.SessionLocal() as db, patch.object(appmod, "get_http_client", return_value=FakeClient()):
+                result = appmod.search_freehire(body, None, db)
+            self.assertEqual(result["jobs_saved"], len(fixtures))
+            self.assertEqual(counts["sponsor_selects"], 1)
+            self.assertEqual(counts["url_equality_selects"], 0)
+            self.assertEqual(counts["url_batch_selects"], 1)
+            self.assertIn("timings_ms", result)
+        finally:
+            event.remove(appmod.engine, "before_cursor_execute", count_queries)
+            with appmod.SessionLocal() as db:
+                fixture_ids = select(appmod.JobRow.id).where(appmod.JobRow.url.like("https://example.invalid/freehire/%"))
+                db.execute(delete(appmod.ApplicationRow).where(appmod.ApplicationRow.job_id.in_(fixture_ids)))
+                db.execute(delete(appmod.JobRow).where(appmod.JobRow.url.like("https://example.invalid/freehire/%")))
+                db.execute(delete(appmod.SponsorRow).where(appmod.SponsorRow.evidence_url == "https://example.invalid/freehire-sponsor"))
+                db.commit()
+
+    def test_shared_outbound_client_is_reused_and_can_be_reopened(self):
+        appmod.close_http_client()
+        first = appmod.get_http_client()
+        self.assertIs(first, appmod.get_http_client())
+        appmod.close_http_client()
+        reopened = appmod.get_http_client()
+        self.assertIsNot(first, reopened)
+        self.assertFalse(reopened.is_closed)
 
 
 class ExternalDraftPlanTests(unittest.TestCase):
