@@ -1,8 +1,13 @@
 import tempfile
+import json
+import os
+import re
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from api.portal_fill import _allowed_application_host, _field_value, _maybe_open_application, fill_application_page, is_public_https_url
+from api import portal_fill
+from api.portal_fill import _allowed_application_host, _field_value, _fill_connected_chrome_page, is_public_https_url
 
 
 PROFILE = {
@@ -48,75 +53,151 @@ class PortalFieldMappingTests(unittest.TestCase):
         self.assertIsNone(_field_value({"label": "Expected salary"}, PROFILE))
 
 
-class PortalFormBrowserTests(unittest.TestCase):
-    def test_local_application_form_is_filled_and_tailored_files_are_attached(self):
-        try:
-            from playwright.sync_api import sync_playwright
-        except Exception as exc:
-            self.skipTest(f"Playwright is unavailable: {exc}")
+class ConnectedChromePreparationTests(unittest.TestCase):
+    class FakeClient:
+        def __init__(self, state, after_navigation=None):
+            self.state = state
+            self.after_navigation = after_navigation
+            self.calls = []
 
-        with tempfile.TemporaryDirectory(prefix="neural-ant-form-test-") as temp_dir:
-            resume = Path(temp_dir) / "tailored-resume.docx"
-            cover = Path(temp_dir) / "tailored-cover-letter.docx"
-            resume.write_bytes(b"resume fixture")
-            cover.write_bytes(b"cover fixture")
-            with sync_playwright() as playwright:
-                try:
-                    browser = playwright.chromium.launch(headless=True, channel="chrome")
-                except Exception:
-                    try:
-                        browser = playwright.chromium.launch(headless=True)
-                    except Exception as exc:
-                        self.skipTest(f"No Playwright browser is installed: {exc}")
-                page = browser.new_page()
-                page.set_content("""
-                  <form>
-                    <label>First Name<input autocomplete="given-name" required></label>
-                    <label>Last Name<input autocomplete="family-name" required></label>
-                    <label>Email<input type="email" autocomplete="email" required></label>
-                    <label>Phone<input type="tel" autocomplete="tel"></label>
-                    <label>Street Address<input autocomplete="address-line1"></label>
-                    <label>City<input autocomplete="address-level2"></label>
-                    <label>State<input autocomplete="address-level1"></label>
-                    <label>ZIP Code<input autocomplete="postal-code"></label>
-                    <label>Current employer<input></label>
-                    <label>Current job title<input></label>
-                    <label>LinkedIn profile<input></label>
-                    <label>GitHub profile<input></label>
-                    <label>School<input></label>
-                    <label>Degree<input></label>
-                    <label>Skills<textarea></textarea></label>
-                    <label>Do you need visa sponsorship?<input required></label>
-                    <label>Expected salary<input required></label>
-                    <label for="resume">Resume/CV<input id="resume" type="file" required></label>
-                    <label for="cover">Cover Letter<input id="cover" type="file"></label>
-                    <button type="submit">Submit application</button>
-                  </form>
-                  <iframe name="embedded-profile"></iframe>
-                """)
-                embedded = page.frame(name="embedded-profile")
-                embedded.set_content('<label>GitHub profile<input></label>')
-                result = fill_application_page(page, PROFILE, str(resume), str(cover))
-                self.assertEqual(result["status"], "ready")
-                self.assertIn("tailored resume", result["uploaded"])
-                self.assertIn("tailored cover letter", result["uploaded"])
-                self.assertEqual(page.locator('input[autocomplete="given-name"]').input_value(), "Joshua")
-                self.assertEqual(page.locator('input[type="email"]').input_value(), PROFILE["email"])
-                self.assertEqual(page.locator('input[autocomplete="address-level2"]').input_value(), PROFILE["city"])
-                self.assertEqual(embedded.locator('input').input_value(), PROFILE["github_url"])
-                self.assertEqual(page.locator('input').nth(14).input_value(), "")
-                self.assertEqual(page.locator('input').nth(15).input_value(), "")
-                self.assertEqual(page.locator('button[type="submit"]').count(), 1)
-                self.assertIn("Current employer", result["filled"])
-                page.set_content('<form><button type="button" onclick="document.body.dataset.clicked=\'yes\'">Apply</button></form>')
-                _, navigation_note = _maybe_open_application(page, page.context)
-                self.assertIn("direct Apply link", navigation_note)
-                self.assertEqual(page.locator("body").get_attribute("data-clicked"), None)
-                page.set_content('<label for="resume">Resume/CV<input id="resume" type="file" accept=".pdf" required></label>')
-                pdf_only = fill_application_page(page, PROFILE, str(resume))
-                self.assertNotIn("tailored resume", pdf_only["uploaded"])
-                self.assertTrue(any("different file format" in item for item in pdf_only["needs_user"]))
-                browser.close()
+        def tool(self, name, arguments=None, timeout=30):
+            arguments = arguments or {}
+            self.calls.append((name, arguments))
+            if name == "list_pages":
+                return {"structuredContent": {"pages": [{"id": 7, "url": "https://jobs.ashbyhq.com/example/role", "title": "Application"}]}}
+            if name == "evaluate_script":
+                function = arguments.get("function", "")
+                match = re.search(r"const operations = (\[.*?\]);", function, re.S)
+                value = [item["index"] for item in json.loads(match.group(1))] if match else self.state
+                return {"content": [{"type": "text", "text": "Script ran on page and returned:\n```json\n" + json.dumps(value) + "\n```"}]}
+            if name == "navigate_page":
+                self.state = self.after_navigation or self.state
+                return {"content": [{"type": "text", "text": "Navigated."}]}
+            if name == "take_snapshot":
+                return {"structuredContent": {"snapshot": {"root": {"role": "RootWebArea", "name": "Application", "children": [
+                    {"id": "resume-button", "role": "button", "name": "Upload Resume"},
+                ]}}}}
+            if name == "upload_file":
+                return {"content": [{"type": "text", "text": "File uploaded."}]}
+            raise AssertionError(f"Unexpected Chrome tool call: {name}")
+
+    def test_existing_chrome_form_gets_only_supported_values_and_tailored_resume(self):
+        state = {
+            "url": "https://jobs.ashbyhq.com/example/role",
+            "title": "Application",
+            "text": "Applied AI Engineer",
+            "passwordCount": 0,
+            "fields": [
+                {"index": 0, "tag": "input", "type": "text", "visible": True, "label": "First Name", "required": True, "value": ""},
+                {"index": 1, "tag": "input", "type": "email", "visible": True, "label": "Email", "required": True, "value": ""},
+                {"index": 2, "tag": "input", "type": "text", "visible": True, "label": "Do you need H-1B sponsorship?", "required": True, "value": ""},
+                {"index": 3, "tag": "input", "type": "text", "visible": True, "label": "Expected salary", "required": True, "value": ""},
+            ],
+            "files": [{"index": 0, "label": "Resume", "accept": ".docx", "visible": True}],
+            "links": [],
+        }
+        with tempfile.TemporaryDirectory(prefix="neural-ant-connected-chrome-test-") as temp_dir:
+            resume = Path(temp_dir) / "role-resume.docx"
+            resume.write_bytes(b"tailored resume fixture")
+            client = self.FakeClient(state)
+            result = _fill_connected_chrome_page(client, 7, {
+                "url": "https://jobs.ashbyhq.com/example/role",
+                "profile": PROFILE,
+                "resume_path": str(resume),
+                "cover_letter_path": "",
+            })
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["filled"], ["First Name", "Email"])
+        self.assertEqual(result["uploaded"], ["tailored resume"])
+        self.assertTrue(any("H-1B" in item for item in result["needs_user"]))
+        self.assertTrue(any("salary" in item.casefold() for item in result["needs_user"]))
+        names = [name for name, _ in client.calls]
+        self.assertIn("upload_file", names)
+        self.assertNotIn("click", names)
+        upload = next(args for name, args in client.calls if name == "upload_file")
+        self.assertEqual(upload["uid"], "resume-button")
+
+    def test_direct_apply_anchor_opens_form_without_clicking_page_controls(self):
+        posting = {
+            "url": "https://jobs.ashbyhq.com/example/role",
+            "title": "Applied AI Engineer",
+            "text": "Role details",
+            "passwordCount": 0,
+            "fields": [],
+            "files": [],
+            "links": [{"text": "Apply now", "href": "https://jobs.ashbyhq.com/example/application", "visible": True, "inForm": False}],
+        }
+        form = {**posting, "url": "https://jobs.ashbyhq.com/example/application", "links": [], "fields": [
+            {"index": 0, "tag": "input", "type": "email", "visible": True, "label": "Email", "required": True, "value": ""},
+        ]}
+        client = self.FakeClient(posting, after_navigation=form)
+        result = _fill_connected_chrome_page(client, 7, {
+            "url": "https://jobs.ashbyhq.com/example/role",
+            "profile": PROFILE,
+            "resume_path": "",
+            "cover_letter_path": "",
+        })
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["filled"], ["Email"])
+        self.assertIn("navigate_page", [name for name, _ in client.calls])
+        self.assertNotIn("click", [name for name, _ in client.calls])
+
+    def test_unrecognized_portal_gets_no_profile_data(self):
+        client = self.FakeClient({})
+        client.tool = lambda name, arguments=None, timeout=30: {
+            "structuredContent": {"pages": [{"id": 7, "url": "https://lookalike-apply.example.test/form", "title": "Application"}]}
+        }
+        result = _fill_connected_chrome_page(client, 7, {
+            "url": "https://jobs.ashbyhq.com/example/role",
+            "profile": PROFILE,
+            "resume_path": "/private/tailored.docx",
+            "cover_letter_path": "",
+        })
+        self.assertEqual(result["status"], "unrecognized_portal")
+        self.assertEqual(result["filled"], [])
+
+    def test_mcp_bridge_uses_current_chrome_and_disables_telemetry(self):
+        with tempfile.TemporaryDirectory(prefix="neural-ant-fake-mcp-") as temp_dir:
+            executable = Path(temp_dir) / "fake-chrome-devtools-mcp"
+            args_record = Path(temp_dir) / "args.json"
+            executable.write_text("""#!/usr/bin/env python3
+import json, os, sys
+Path = __import__('pathlib').Path
+Path(os.environ['NA_ARGS_RECORD']).write_text(json.dumps(sys.argv[1:]))
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    if 'id' not in message:
+        continue
+    if method == 'initialize':
+        result = {'protocolVersion': '2024-11-05', 'capabilities': {}, 'serverInfo': {'name': 'fake', 'version': '1'}}
+    elif method == 'tools/list':
+        names = ['list_pages', 'new_page', 'navigate_page', 'evaluate_script', 'take_snapshot', 'upload_file']
+        result = {'tools': [{'name': name, 'inputSchema': {'type': 'object'}} for name in names]}
+    else:
+        result = {}
+    print(json.dumps({'jsonrpc': '2.0', 'id': message['id'], 'result': result}), flush=True)
+""")
+            executable.chmod(0o700)
+            with patch.object(portal_fill, "_CHROME_MCP_BIN", executable), patch.dict(os.environ, {"NA_ARGS_RECORD": str(args_record)}):
+                client = portal_fill._ChromeDevtoolsClient(timeout=5)
+                client.close()
+            args = json.loads(args_record.read_text())
+        self.assertIn("--autoConnect", args)
+        self.assertIn("--no-usage-statistics", args)
+        self.assertIn("--no-performance-crux", args)
+        self.assertFalse(any("userDataDir" in arg or "user-data-dir" in arg or "isolated" in arg for arg in args))
+
+    def test_chrome_settings_open_in_existing_app_without_a_new_profile(self):
+        with patch.object(portal_fill.platform, "system", return_value="Darwin"), patch.object(
+            portal_fill.Path, "exists", return_value=True
+        ), patch.object(portal_fill.subprocess, "Popen") as popen:
+            result = portal_fill.open_chrome_remote_debugging_settings()
+        self.assertTrue(result["ok"])
+        args = popen.call_args.args[0]
+        self.assertEqual(args[0:2], ["open", "-a"])
+        self.assertEqual(args[-1], "chrome://inspect/#remote-debugging")
+        self.assertNotIn("--user-data-dir", args)
 
 
 if __name__ == "__main__":

@@ -5,7 +5,7 @@
 <p align="center">
   <a href="https://github.com/joshuaadmissions-web/neural-ant/actions/workflows/ci.yml"><img src="https://github.com/joshuaadmissions-web/neural-ant/actions/workflows/ci.yml/badge.svg" alt="CI" height="20"></a>
   <img src="https://img.shields.io/badge/Python-3.10%2B-3776AB?style=flat" alt="Python 3.10 or newer" height="20">
-  <img src="https://img.shields.io/badge/Node.js-20%2B-339933?style=flat" alt="Node.js 20 or newer" height="20">
+  <img src="https://img.shields.io/badge/Node.js-20.19%2B-339933?style=flat" alt="Node.js 20.19 or newer" height="20">
 </p>
 
 <p align="center">
@@ -23,11 +23,11 @@
   <a href="docs/ai-job-search-workflow-parity.md"><b>Workflow notes</b></a>
 </p>
 
-> Neural Ant prepares your role-specific materials, opens the employer form in a dedicated local browser, and fills blank fields that map to saved profile facts. You review the form and submit it yourself.
+> Neural Ant prepares your role-specific materials, opens the employer form in your existing Chrome session, and fills blank fields that map to saved profile facts. You review the form and submit it yourself.
 
 ## How it works
 
-The Chat page combines the reference workflow—`/setup → /scrape → /rank → /apply`—into a short flow. Upload a PDF or DOCX resume and Neural Ant starts matching searches automatically; **Search again** reruns them later. Independent job sources run in parallel, then listings are ranked against the saved profile. Select up to five roles to prepare review packs together, or choose **Prepare to apply** on one role. For a single role, Neural Ant tailors the resume and cover letter, opens the employer form in Chrome, uploads the tailored files, and fills blank fields it can map to saved profile facts. It reports fields that still need you. The employer receives data only for the role you selected. You review the form and submit it yourself; authentication, human checks, visa/legal attestations, EEO questions, and unknown answers stay with you. **A/B timing** compares the same search plan in parallel and sequential modes; timing history stays in the browser and stores durations and counts only.
+The Chat page combines the reference workflow—`/setup → /scrape → /rank → /apply`—into a short flow. Upload a PDF or DOCX resume and Neural Ant starts matching searches automatically; **Search again** reruns them later. Independent job sources run in parallel, then listings are ranked against the saved profile. Select up to five roles to prepare review packs together, or choose **Prepare to apply** on one role. For a single role, Neural Ant tailors the resume and cover letter, opens the employer form in a new tab in your regular Chrome session, uploads the tailored files, and fills blank fields it can map to saved profile facts. It reports fields that still need you. The employer receives data only for the role you selected. You review the form and submit it yourself; authentication, human checks, visa/legal attestations, EEO questions, and unknown answers stay with you. **A/B timing** compares the same search plan in parallel and sequential modes; timing history stays in the browser and stores durations and counts only.
 
 | Step | What Neural Ant does |
 |---|---|
@@ -63,7 +63,7 @@ On the first run, the script installs dependencies, builds the interface, and cr
 
 Local mode stores the database and resume under `data/` and listens on your Mac only. It runs while the Mac and terminal process are active. Do not expose the local server to a network.
 
-The first local run also installs Playwright Chromium if Chrome is not already installed. Portal preparation opens a visible, separate Chrome tab in Neural Ant's own browser profile at `~/.neural-ant/portal-browser`. Employer sign-in sessions can persist there on this device; use **Forget portal sign-ins** on the review screen to remove them. This browser profile is separate from your everyday Chrome profile.
+Portal preparation connects to your already-running regular Chrome through Chrome's built-in Remote Debugging permission flow. The first time, open **chrome://inspect/#remote-debugging** in your normal Chrome window and enable Remote Debugging. When you choose **Prepare to apply**, Chrome asks you to approve Neural Ant's connection. Neural Ant then opens the job in a new tab in that same Chrome profile, so existing employer sign-ins are available. The app does not launch a second or guest profile and does not install a browser extension. Chrome grants access to the selected profile's active tabs and browser state while connected; use **Disconnect Neural Ant from Chrome** to stop Neural Ant's access while leaving your tabs and sign-ins intact. The local Chrome DevTools process disables usage-statistics and CrUX reporting.
 
 ## Privacy and boundaries
 

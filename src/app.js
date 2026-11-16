@@ -172,7 +172,7 @@ async function loadSavedDraftPreview(jobId,draftId){
 function updatePortalRunUi(run){
  const panel=$("portalPreparation");if(!panel)return;panel.classList.remove("hidden");
  const status=$("portalPreparationStatus"),details=$("portalPreparationDetails"),continueButton=$("continuePortalButton");
- const messages={queued:"Opening the employer form in Chrome…",opening:"Opening and preparing the employer form…",ready:"Employer form is ready in Chrome. Review every entry and submit it yourself.",sign_in_required:"Sign in to the employer portal in Chrome, then continue here.",needs_manual_navigation:"The job page is open in Chrome. Open its application form, then continue here.",human_verification_required:"Complete the human check in Chrome. Review the form before you submit it.",unrecognized_portal:"The portal site could not be verified. Review it manually; no profile data or résumé was sent.",failed:"Neural Ant could not prepare this employer form."};
+ const messages={queued:"Opening the employer form in your Chrome…",connecting_chrome:"Waiting for your regular Chrome. Approve Neural Ant's access prompt in that window if it appears.",opening:"Opening and preparing the employer form in your Chrome…",chrome_setup_required:"Neural Ant could not connect to your regular Chrome. Enable Remote Debugging there, then retry. No separate browser profile was opened.",ready:"Employer form is ready in your Chrome. Review every entry and submit it yourself.",disconnected:"Neural Ant disconnected from Chrome. Your Chrome tabs and sign-ins are still open.",sign_in_required:"Sign in to the employer portal in your Chrome, then continue here.",needs_manual_navigation:"The posting is open in your Chrome. Open its application form, then continue here.",human_verification_required:"Complete the human check in Chrome. Review the form before you submit it.",unrecognized_portal:"The portal site could not be verified. Review it manually; no profile data or résumé was sent.",failed:"Neural Ant could not prepare this employer form."};
  if(status)status.textContent=run.message&&run.status==="failed"?run.message:(messages[run.status]||run.message||"Preparing the employer form…");
  const lines=[];
  if(run.host)lines.push("Employer site: "+run.host);
@@ -181,22 +181,24 @@ function updatePortalRunUi(run){
  if(run.needs_user?.length)lines.push("For you to review: "+run.needs_user.join(" · "));
  if(run.status==="ready"&&!run.uploaded?.includes("tailored resume"))lines.push("Attach the tailored résumé manually if this form has an upload field.");
  if(details)details.textContent=lines.join("\n");
- if(continueButton)continueButton.classList.toggle("hidden",!['sign_in_required','needs_manual_navigation'].includes(run.status));
+ if(continueButton){const canContinue=['chrome_setup_required','sign_in_required','needs_manual_navigation'].includes(run.status);continueButton.classList.toggle("hidden",!canContinue);continueButton.textContent=run.status==='chrome_setup_required'?'Retry using my Chrome':run.status==='needs_manual_navigation'?'Fill open form':'Fill after sign-in'}
+ const settingsButton=$("openChromeSettingsButton");if(settingsButton)settingsButton.classList.toggle("hidden",!['connecting_chrome','chrome_setup_required'].includes(run.status));
+ const disconnectButton=$("disconnectChromeButton");if(disconnectButton)disconnectButton.classList.toggle("hidden",!['ready','human_verification_required','sign_in_required','needs_manual_navigation'].includes(run.status));
 }
 const portalPause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function pollPortalRun(runId){
- for(let attempt=0;attempt<90;attempt++){
+ for(let attempt=0;attempt<240;attempt++){
   const run=await api('/portal-runs/'+encodeURIComponent(runId));
   updatePortalRunUi(run);
-  if(!['queued','opening'].includes(run.status))return run;
-  await portalPause(700);
+  if(!['queued','opening','connecting_chrome'].includes(run.status))return run;
+  await portalPause(750);
  }
- updatePortalRunUi({status:'opening',message:'Chrome is still opening the employer form. Keep Neural Ant running.'});
+ updatePortalRunUi({status:'connecting_chrome',message:'Chrome is still waiting for its access prompt. Approve Neural Ant in your regular Chrome window, then keep this page open.'});
  return null;
 }
 async function openPortalForReview(applicationId){
  const panel=$("portalPreparation");if(panel)panel.classList.remove("hidden");
- updatePortalRunUi({status:'queued',message:'Opening the employer application in a separate Chrome tab…'});
+ updatePortalRunUi({status:'queued',message:'Opening the employer application in a new tab in your Chrome…'});
  try{
   const run=await api('/applications/'+applicationId+'/prepare-portal',{method:'POST'});
   activePortalRunId=run.run_id;
@@ -211,9 +213,11 @@ async function continuePortalPreparation(){
  try{const run=await api('/portal-runs/'+encodeURIComponent(activePortalRunId)+'/continue',{method:'POST'});updatePortalRunUi(run);await pollPortalRun(activePortalRunId)}catch(error){updatePortalRunUi({status:'failed',message:error.message||'Could not continue form preparation.'})}
  finally{if(button){button.disabled=false;button.textContent='Fill after sign-in'}}
 }
-async function forgetPortalSessions(){
- if(!confirm('Close Neural Ant browser tabs and remove saved employer sign-ins from this device?'))return;
- try{const run=await api('/portal-browser/forget-sessions',{method:'POST'});activePortalRunId=run.run_id;await pollPortalRun(activePortalRunId);toast('Saved employer sign-ins removed from this device.')}catch(error){toast(error.message)}
+async function openChromeRemoteDebuggingSettings(){
+ try{const result=await api('/portal-browser/open-settings',{method:'POST'});if(result.message)$('portalPreparationStatus').textContent=result.message;toast(result.message||'Opened Chrome connection settings.')}catch(error){toast(error.message)}
+}
+async function disconnectChrome(){
+ try{const result=await api('/portal-browser/disconnect',{method:'POST'});activePortalRunId=result.run_id;await pollPortalRun(activePortalRunId);toast('Neural Ant disconnected; Chrome tabs and sign-ins remain open.')}catch(error){toast(error.message)}
 }
 async function prepareApplication(id,button=null){
  const job=savedJobsCache.find(item=>Number(item.id)===Number(id));

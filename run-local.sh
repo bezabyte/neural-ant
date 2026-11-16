@@ -9,7 +9,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 1
 fi
 if ! command -v node >/dev/null 2>&1 || ! command -v npm >/dev/null 2>&1; then
-  echo "Node.js and npm are required to build the app. Install Node.js 20 or newer, then run this again."
+  echo "Node.js and npm are required to build the app. Install Node.js 20.19+, 22.12+, or 23+, then run this again."
   exit 1
 fi
 
@@ -20,17 +20,8 @@ fi
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-if [ ! -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && \
-   [ ! -x "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && \
-   ! command -v google-chrome >/dev/null 2>&1 && \
-   ! command -v google-chrome-stable >/dev/null 2>&1 && \
-   ! command -v chromium >/dev/null 2>&1 && \
-   ! command -v chromium-browser >/dev/null 2>&1; then
-  browser_path="$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
-  if [ ! -x "$browser_path" ]; then
-    python -m playwright install chromium
-  fi
-fi
+node -e 'const [major,minor]=process.versions.node.split(".").map(Number);if(!(major===20&&minor>=19||major===22&&minor>=12||major>=23)){console.error("Node.js 20.19+, 22.12+, or 23+ is required for local Chrome control.");process.exit(1)}' || exit 1
+npm ci --no-audit --no-fund
 npm run build
 
 if [ ! -f .env.local ]; then

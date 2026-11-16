@@ -39,9 +39,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, rela
 from api.docx_export import build_cover_letter_docx, build_resume_docx
 from api.portal_fill import (
     continue_portal_run,
-    forget_portal_sessions,
+    disconnect_portal_browser,
     get_portal_run,
     is_public_https_url,
+    open_chrome_settings,
     shutdown_portal_browser_worker,
     start_portal_run,
 )
@@ -2841,10 +2842,16 @@ def continue_portal_preparation(run_id: str, request: Request, _: None = Depends
     return result
 
 
-@app.post("/api/portal-browser/forget-sessions")
-def remove_portal_browser_sessions(request: Request, _: None = Depends(require_auth)):
+@app.post("/api/portal-browser/open-settings")
+def open_portal_browser_settings(request: Request, _: None = Depends(require_auth)):
     require_local_portal_browser(request)
-    return forget_portal_sessions()
+    return open_chrome_settings()
+
+
+@app.post("/api/portal-browser/disconnect")
+def disconnect_portal_browser_session(request: Request, _: None = Depends(require_auth)):
+    require_local_portal_browser(request)
+    return disconnect_portal_browser()
 
 
 def csv_safe_cell(value: Any) -> str:

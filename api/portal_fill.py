@@ -1,8 +1,9 @@
-"""Local, review-first browser handoff for employer application forms.
+"""Local, review-first handoff through the user's already-running Chrome.
 
-The browser is a dedicated Neural Ant profile. It is visible to the user and is
-never used to submit an application. Only blank, plainly labeled fields with a
-direct match in the saved profile are populated.
+Chrome's explicit remote-debugging consent connects Neural Ant to the user's
+regular signed-in Chrome session. Neural Ant never launches a second profile or
+submits an application. Only blank, plainly labeled fields with a direct match
+in the saved profile are populated.
 """
 
 from __future__ import annotations
@@ -14,8 +15,10 @@ import platform
 import queue
 import re
 import shutil
+import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -28,6 +31,8 @@ _TASKS: queue.Queue[tuple[str, str, dict[str, Any]] | None] = queue.Queue()
 _WORKER: threading.Thread | None = None
 _MAX_RUNS = 100
 _RUN_PRIVATE: dict[str, dict[str, Any]] = {}
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_CHROME_MCP_BIN = _REPO_ROOT / "node_modules" / ".bin" / "chrome-devtools-mcp"
 _ATS_HOSTS = (
     "greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", "workable.com",
     "myworkdayjobs.com", "workday.com", "icims.com", "jobvite.com", "successfactors.com",
@@ -205,73 +210,6 @@ def _field_value(descriptor: dict[str, Any], profile: dict[str, Any]) -> tuple[s
     return None
 
 
-def _describe_form(page) -> list[dict[str, Any]]:
-    return page.locator("input:not([type=file]), textarea, select").evaluate_all("""elements => elements.map((el, index) => {
-      const visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-      const labels = Array.from(el.labels || []).map(node => (node.innerText || node.textContent || '').trim()).filter(Boolean);
-      const parentLabel = el.closest('label');
-      if (parentLabel) labels.push((parentLabel.innerText || parentLabel.textContent || '').trim());
-      const fieldset = el.closest('fieldset');
-      const legend = fieldset?.querySelector('legend')?.innerText || '';
-      return {
-        index, tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), visible,
-        label: [...new Set([...labels, legend])].filter(Boolean).join(' '),
-        name: el.getAttribute('name') || '', id: el.id || '', placeholder: el.getAttribute('placeholder') || '',
-        autocomplete: el.getAttribute('autocomplete') || '', required: !!el.required,
-        value: el.value || '', options: el.tagName === 'SELECT' ? Array.from(el.options).map(o => ({label:o.textContent.trim(), value:o.value})) : []
-      };
-    })""")
-
-
-def _page_frames(page) -> list[Any]:
-    try:
-        return list(page.frames)
-    except Exception:
-        return [page]
-
-
-def _has_application_fields(page) -> bool:
-    for frame in _page_frames(page):
-        try:
-            if frame != page.main_frame and frame.url != "about:blank" and not _allowed_application_host(page.url, frame.url):
-                continue
-            if frame.locator('input[type="file"]').count() > 0:
-                return True
-            fields = _describe_form(frame)
-            if any(_field_value(item, {"name": "x", "email": "x", "phone": "x"}) for item in fields):
-                return True
-        except Exception:
-            continue
-    return False
-
-
-def _page_has_auth_gate(page) -> bool:
-    try:
-        if any(
-            frame.locator('input[type="password"]').count() > 0
-            for frame in _page_frames(page)
-            if frame == page.main_frame or frame.url == "about:blank" or _allowed_application_host(page.url, frame.url)
-        ):
-            return True
-        url = page.url.casefold()
-        title = page.title().casefold()
-        return any(term in url or term in title for term in ("/login", "sign-in", "signin", "log in", "login"))
-    except Exception:
-        return False
-
-
-def _page_needs_human_verification(page) -> bool:
-    try:
-        chunks = [page.title(), page.locator("body").inner_text(timeout=1200)[:12000]]
-        for frame in _page_frames(page):
-            if frame != page.main_frame:
-                chunks.append(frame.locator("body").inner_text(timeout=600)[:6000])
-        text = " ".join(chunks).casefold()
-        return any(term in text for term in ("captcha", "i'm not a robot", "verify you are human", "human verification", "security check"))
-    except Exception:
-        return False
-
-
 def _file_accepts_path(accept: str, path: str) -> bool:
     accept = str(accept or "").casefold().replace(" ", "")
     if not accept:
@@ -286,153 +224,423 @@ def _file_accepts_path(accept: str, path: str) -> bool:
     return False
 
 
-def _maybe_open_application(page, context):
-    """Follow one direct Apply link; never click a form button or submit control."""
-    try:
-        if _has_application_fields(page):
-            return page, ""
-        matches = page.locator("a[href]").evaluate_all("""els => els.map((el, index) => {
-          const text = (el.innerText || el.getAttribute('aria-label') || '').trim().replace(/\\s+/g, ' ');
-          const visible = !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-          const href = el.getAttribute('href') || '';
-          return {index, text, href, visible, inForm: !!el.closest('form')};
-        }).filter(x => x.visible && !x.inForm && x.href && !/^(#|javascript:|mailto:)/i.test(x.href) && /^(apply|apply now|apply online|apply for this job|apply to this job|start application)$/i.test(x.text))""")
-        if len(matches) != 1:
-            return page, "No single direct Apply link was found. The posting is open; open its application form in Chrome, then choose Fill after sign-in in Neural Ant."
-        destination = urljoin(page.url, matches[0]["href"])
-        if not is_public_https_url(destination):
-            return page, "The Apply link was not a safe public HTTPS address. Open the application form yourself, then choose Fill after sign-in."
-        if not _allowed_application_host(page.url, destination):
-            return page, "The Apply link opens an unrecognized portal. Review the site in Chrome; Neural Ant left your profile and résumé unshared."
-        page.goto(destination, wait_until="domcontentloaded", timeout=30000)
-        if not is_public_https_url(page.url):
-            return page, "The application link redirected to a non-public address. Review it in Chrome before continuing."
-        return page, ""
-    except Exception:
-        return page, "The posting opened, but Neural Ant could not identify its application form. Open the form in Chrome and choose Fill after sign-in."
+class ChromeConnectionError(RuntimeError):
+    """Chrome is not yet available for an explicitly approved local session."""
 
 
-def fill_application_page(page, profile: dict[str, Any], resume_path: str, cover_letter_path: str = "", posting_url: str = "") -> dict[str, Any]:
-    """Fill blank, supported fields and upload available tailored documents."""
-    if posting_url and (not is_public_https_url(page.url) or not _allowed_application_host(posting_url, page.url)):
-        return {"status": "unrecognized_portal", "filled": [], "uploaded": [], "needs_user": ["Review the employer portal host before entering personal details."], "message": "The page is on a different, unrecognized host. Neural Ant left your saved details and résumé unshared."}
-    if _page_has_auth_gate(page):
-        return {"status": "sign_in_required", "filled": [], "uploaded": [], "needs_user": ["Sign in to the employer portal, then return and choose Fill after sign-in."], "message": "Sign in in the visible Chrome window, then continue here."}
+class _ChromeDevtoolsClient:
+    """Minimal stdio MCP client for the official Chrome DevTools MCP server."""
 
-    filled: list[str] = []
-    needs_user: list[str] = []
-    frames = _page_frames(page)
-    for frame in frames:
+    def __init__(self, on_wait=None, timeout: float = 90.0):
+        if not _CHROME_MCP_BIN.is_file():
+            raise ChromeConnectionError("Chrome control is not installed. Restart Neural Ant with run-local.sh.")
+        command = [
+            str(_CHROME_MCP_BIN), "--autoConnect", "--no-usage-statistics", "--no-performance-crux",
+            "--no-categoryPerformance", "--no-categoryNetwork", "--no-categoryMemory",
+            "--no-categoryEmulation", "--no-categoryNetworkMocks", "--no-categoryWebauthn",
+        ]
+        self.process = subprocess.Popen(
+            command,
+            cwd=str(_REPO_ROOT),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            bufsize=1,
+        )
+        self._messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._errors: queue.Queue[str] = queue.Queue()
+        self._next_id = 0
+        self._write_lock = threading.Lock()
+        threading.Thread(target=self._read_stdout, name="neural-ant-chrome-mcp-out", daemon=True).start()
+        threading.Thread(target=self._read_stderr, name="neural-ant-chrome-mcp-err", daemon=True).start()
         try:
-            if frame != page.main_frame and frame.url != "about:blank" and not _allowed_application_host(page.url, frame.url):
-                continue
-            fields = _describe_form(frame)
+            response_id = self._send_request("initialize", {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "neural-ant", "version": "0.1.0"},
+            })
+            response = self._wait_response(response_id, timeout, on_wait=on_wait)
+            if response.get("error"):
+                raise ChromeConnectionError(self._error_text(response))
+            self._notify("notifications/initialized", {})
+            listed = self.call("tools/list", {}, timeout=20)
+            tools = {item.get("name") for item in listed.get("tools", [])}
+            required = {"list_pages", "new_page", "navigate_page", "evaluate_script", "take_snapshot", "upload_file"}
+            if not required.issubset(tools):
+                raise ChromeConnectionError("Chrome connected, but the form-filling tools are unavailable. Restart Neural Ant and try again.")
         except Exception:
-            continue
-        for item in fields:
-            if not item.get("visible") or item.get("type") in {"hidden", "password", "checkbox", "radio", "submit", "button", "reset", "image"}:
-                continue
-            if item.get("value"):
-                continue
-            match = _field_value(item, profile)
-            if not match:
-                if item.get("required") and item.get("label"):
-                    label = str(item["label"]).strip()
-                    needs_user.append("Review required field: " + label[:120])
-                continue
-            value, source = match
-            locator = frame.locator("input:not([type=file]), textarea, select").nth(int(item["index"]))
+            self.close()
+            raise
+
+    def _read_stdout(self) -> None:
+        assert self.process.stdout is not None
+        try:
+            for line in self.process.stdout:
+                try:
+                    message = json.loads(line)
+                except json.JSONDecodeError:
+                    self._errors.put(line.strip()[:500])
+                    continue
+                if isinstance(message, dict):
+                    self._messages.put(message)
+        finally:
+            self._messages.put(None)
+
+    def _read_stderr(self) -> None:
+        assert self.process.stderr is not None
+        for line in self.process.stderr:
+            cleaned = line.strip()
+            if cleaned:
+                self._errors.put(cleaned[:500])
+
+    def _send_request(self, method: str, params: dict[str, Any]) -> int:
+        self._next_id += 1
+        message = {"jsonrpc": "2.0", "id": self._next_id, "method": method, "params": params}
+        assert self.process.stdin is not None
+        with self._write_lock:
+            self.process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+            self.process.stdin.flush()
+        return self._next_id
+
+    def _notify(self, method: str, params: dict[str, Any]) -> None:
+        assert self.process.stdin is not None
+        with self._write_lock:
+            self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "method": method, "params": params}, separators=(",", ":")) + "\n")
+            self.process.stdin.flush()
+
+    @staticmethod
+    def _error_text(response: dict[str, Any]) -> str:
+        error = response.get("error") or {}
+        return str(error.get("message") or "Chrome refused the remote-debugging connection.")[:400]
+
+    def _wait_response(self, response_id: int, timeout: float, on_wait=None) -> dict[str, Any]:
+        deadline = time.monotonic() + timeout
+        last_update = 0.0
+        while time.monotonic() < deadline:
+            if self.process.poll() is not None:
+                detail = self._recent_error()
+                raise ChromeConnectionError(detail or "Chrome remote debugging is not enabled in your regular Chrome profile.")
             try:
-                if item["tag"] == "select":
-                    options = item.get("options") or []
-                    option = next((entry for entry in options if str(entry.get("label", "")).casefold().strip() == value.casefold().strip()), None)
-                    if option is None:
-                        option = next((entry for entry in options if str(entry.get("value", "")).casefold().strip() == value.casefold().strip()), None)
-                    if option:
-                        locator.select_option(value=str(option["value"]))
-                        filled.append(str(item.get("label") or source)[:80])
-                else:
-                    locator.fill(value)
-                    filled.append(str(item.get("label") or source)[:80])
+                message = self._messages.get(timeout=min(0.5, max(0.05, deadline - time.monotonic())))
+            except queue.Empty:
+                message = {}
+            if message is None:
+                detail = self._recent_error()
+                raise ChromeConnectionError(detail or "Chrome remote debugging is not enabled in your regular Chrome profile.")
+            if message.get("id") == response_id:
+                return message
+            if on_wait and time.monotonic() - last_update >= 3:
+                on_wait()
+                last_update = time.monotonic()
+        raise ChromeConnectionError("Timed out waiting for Chrome. Enable Remote Debugging in your regular Chrome, then approve Neural Ant's access prompt.")
+
+    def _recent_error(self) -> str:
+        lines = []
+        while True:
+            try:
+                lines.append(self._errors.get_nowait())
+            except queue.Empty:
+                break
+        message = " ".join(lines[-4:]).strip()
+        if any(term in message.casefold() for term in ("remote debugging", "auto-connect", "autoconnect", "permission", "consent", "connect")):
+            return message[:400]
+        return ""
+
+    def call(self, method: str, params: dict[str, Any], timeout: float = 30) -> dict[str, Any]:
+        response_id = self._send_request(method, params)
+        response = self._wait_response(response_id, timeout)
+        if response.get("error"):
+            raise RuntimeError(self._error_text(response))
+        return response.get("result") or {}
+
+    def tool(self, name: str, arguments: dict[str, Any] | None = None, timeout: float = 30) -> dict[str, Any]:
+        response = self.call("tools/call", {"name": name, "arguments": arguments or {}}, timeout=timeout)
+        if response.get("isError"):
+            texts = [part.get("text", "") for part in response.get("content", []) if part.get("type") == "text"]
+            raise RuntimeError(" ".join(texts).strip()[:500] or f"Chrome DevTools tool {name} failed.")
+        return response
+
+    def close(self) -> None:
+        if self.process.poll() is None:
+            try:
+                if self.process.stdin:
+                    self.process.stdin.close()
+                self.process.terminate()
+                self.process.wait(timeout=3)
             except Exception:
-                if item.get("required") and item.get("label"):
-                    needs_user.append("Review required field: " + str(item["label"])[:120])
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+        for stream in (self.process.stdin, self.process.stdout, self.process.stderr):
+            try:
+                if stream and not stream.closed:
+                    stream.close()
+            except OSError:
+                pass
+
+
+def open_chrome_remote_debugging_settings() -> dict[str, str]:
+    """Open Chrome's opt-in page in its normal profile without launching another profile."""
+    url = "chrome://inspect/#remote-debugging"
+    if platform.system() == "Darwin":
+        app = Path("/Applications/Google Chrome.app")
+        user_app = Path.home() / "Applications/Google Chrome.app"
+        if app.exists():
+            subprocess.Popen(["open", "-a", str(app), url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        elif user_app.exists():
+            subprocess.Popen(["open", "-a", str(user_app), url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            raise ChromeConnectionError("Google Chrome was not found on this Mac.")
+    elif platform.system() == "Windows":
+        os.startfile(url)  # type: ignore[attr-defined]
+    else:
+        browser = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
+        if not browser:
+            raise ChromeConnectionError("Google Chrome was not found on this device.")
+        subprocess.Popen([browser, url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return {"ok": True, "message": "Opened Chrome's Remote Debugging settings in your regular Chrome window."}
+
+
+def _mcp_content_text(response: dict[str, Any]) -> str:
+    return "\n".join(
+        str(item.get("text", ""))
+        for item in response.get("content", [])
+        if item.get("type") == "text"
+    )
+
+
+def _mcp_script_value(response: dict[str, Any]) -> Any:
+    text = _mcp_content_text(response)
+    match = re.search(r"```json\s*(.*?)\s*```", text, re.S)
+    if not match:
+        raise RuntimeError("Chrome could not read the application form.")
+    try:
+        return json.loads(match.group(1))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Chrome returned an unreadable form description.") from exc
+
+
+def _mcp_pages(response: dict[str, Any]) -> list[dict[str, Any]]:
+    structured = response.get("structuredContent") or {}
+    pages = structured.get("pages") if isinstance(structured, dict) else None
+    return pages if isinstance(pages, list) else []
+
+
+def _mcp_page_state(client: _ChromeDevtoolsClient, page_id: int) -> dict[str, Any]:
+    result = client.tool("evaluate_script", {
+        "pageId": page_id,
+        "waitForStableDom": False,
+        "function": r"""() => {
+          const clean = value => (value || '').replace(/\s+/g, ' ').trim();
+          const visible = el => !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+          const labelsFor = el => {
+            const labels = Array.from(el.labels || []).map(node => clean(node.innerText || node.textContent));
+            const parent = el.closest('label');
+            if (parent) labels.push(clean(parent.innerText || parent.textContent));
+            const labelledBy = (el.getAttribute('aria-labelledby') || '').split(/\s+/).filter(Boolean)
+              .map(id => document.getElementById(id)).filter(Boolean).map(node => clean(node.innerText || node.textContent));
+            const aria = el.getAttribute('aria-label') || '';
+            const fieldset = el.closest('fieldset');
+            const legend = fieldset?.querySelector('legend');
+            if (legend) labels.push(clean(legend.innerText || legend.textContent));
+            return [...new Set([...labels, ...labelledBy, aria].filter(Boolean))].join(' ');
+          };
+          const controls = Array.from(document.querySelectorAll('input:not([type=file]), textarea, select'));
+          const fields = controls.map((el, index) => ({
+            index, tag: el.tagName.toLowerCase(), type: (el.type || '').toLowerCase(), visible: visible(el),
+            label: labelsFor(el), name: el.getAttribute('name') || '', id: el.id || '',
+            placeholder: el.getAttribute('placeholder') || '', autocomplete: el.getAttribute('autocomplete') || '',
+            required: !!el.required || el.getAttribute('aria-required') === 'true',
+            disabled: !!el.disabled || !!el.readOnly, value: el.value || '',
+            options: el.tagName === 'SELECT' ? Array.from(el.options).map(option => ({label: clean(option.textContent), value: option.value})) : []
+          }));
+          const files = Array.from(document.querySelectorAll('input[type=file]')).map((el, index) => ({
+            index, label: [labelsFor(el), el.name || '', el.id || '', el.getAttribute('data-testid') || ''].filter(Boolean).join(' '),
+            accept: el.accept || '', visible: visible(el), disabled: !!el.disabled
+          }));
+          const links = Array.from(document.querySelectorAll('a[href]')).map(el => ({
+            text: clean(el.innerText || el.getAttribute('aria-label')), href: el.href,
+            visible: visible(el), inForm: !!el.closest('form')
+          })).filter(el => el.visible && !el.inForm && /^(apply|apply now|apply online|apply for this job|apply to this job|start application)$/i.test(el.text));
+          return {url: location.href, title: document.title, text: clean(document.body?.innerText).slice(0, 18000),
+            passwordCount: document.querySelectorAll('input[type=password]').length, fields, files, links};
+        }""",
+    })
+    value = _mcp_script_value(result)
+    if not isinstance(value, dict):
+        raise RuntimeError("Chrome returned an invalid application form description.")
+    return value
+
+
+def _mcp_apply_operations(client: _ChromeDevtoolsClient, page_id: int, operations: list[dict[str, Any]]) -> set[int]:
+    if not operations:
+        return set()
+    script = r"""() => {
+      const controls = Array.from(document.querySelectorAll('input:not([type=file]), textarea, select'));
+      const operations = __OPS__;
+      const completed = [];
+      for (const operation of operations) {
+        const element = controls[operation.index];
+        if (!element || element.disabled || element.readOnly || !element.getClientRects().length || String(element.value || '').trim()) continue;
+        let value = operation.value;
+        if (element.tagName === 'SELECT') {
+          const target = element.options.find(option => option.label.trim().toLowerCase() === String(value).trim().toLowerCase() || option.value.trim().toLowerCase() === String(value).trim().toLowerCase());
+          if (!target) continue;
+          value = target.value;
+          Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, 'value').set.call(element, value);
+        } else if (element.tagName === 'TEXTAREA') {
+          Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value').set.call(element, value);
+        } else {
+          Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set.call(element, value);
+        }
+        element.dispatchEvent(new Event('input', {bubbles: true}));
+        element.dispatchEvent(new Event('change', {bubbles: true}));
+        completed.push(operation.index);
+      }
+      return completed;
+    }""".replace("__OPS__", json.dumps(operations, ensure_ascii=True))
+    response = client.tool("evaluate_script", {"pageId": page_id, "function": script, "waitForStableDom": False})
+    result = _mcp_script_value(response)
+    return {int(index) for index in result if isinstance(index, (int, float))} if isinstance(result, list) else set()
+
+
+def _flatten_accessibility_nodes(value: Any) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    def visit(node: Any) -> None:
+        if not isinstance(node, dict):
+            return
+        found.append(node)
+        for child in node.get("children", []) if isinstance(node.get("children"), list) else []:
+            visit(child)
+    visit(value)
+    return found
+
+
+def _upload_uid(client: _ChromeDevtoolsClient, page_id: int, target_label: str) -> str | None:
+    snapshot = client.tool("take_snapshot", {"pageId": page_id, "verbose": True})
+    structured = snapshot.get("structuredContent") or {}
+    tree = structured.get("snapshot") if isinstance(structured, dict) else None
+    nodes = _flatten_accessibility_nodes(tree.get("root") if isinstance(tree, dict) else tree)
+    pattern = r"\b(resume|résumé|cv|curriculum vitae)\b" if "resume" in target_label.casefold() else r"\b(cover letter|covering letter)\b"
+    candidates = []
+    for node in nodes:
+        role = str(node.get("role") or "").casefold()
+        name = str(node.get("name") or "").strip()
+        uid = str(node.get("id") or "").strip()
+        if uid and name and role in {"button", "textbox", "generic", "group"} and re.search(pattern, name, re.I):
+            candidates.append(uid)
+    return candidates[0] if len(set(candidates)) == 1 else None
+
+
+def _fill_connected_chrome_page(client: _ChromeDevtoolsClient, page_id: int, payload: dict[str, Any]) -> dict[str, Any]:
+    pages_response = client.tool("list_pages")
+    page = next((item for item in _mcp_pages(pages_response) if int(item.get("id", -1)) == int(page_id)), None)
+    if not page:
+        raise RuntimeError("The application tab is no longer available in Chrome. Prepare the role again to reopen it.")
+    page_url = str(page.get("url") or "")
+    posting_url = str(payload["url"])
+    if not is_public_https_url(page_url) or not _allowed_application_host(posting_url, page_url):
+        return {"status": "unrecognized_portal", "filled": [], "uploaded": [], "needs_user": ["Review the employer portal host before entering personal details."], "message": "The page is on a different or unrecognized site. Neural Ant left your profile and résumé unshared."}
+
+    state = _mcp_page_state(client, page_id)
+    page_text = (str(state.get("url", "")) + " " + str(state.get("title", ""))).casefold()
+    if state.get("passwordCount") or any(term in page_text for term in ("/login", "sign-in", "signin", "log in", "login")):
+        return {"status": "sign_in_required", "filled": [], "uploaded": [], "needs_user": ["Sign in to the employer portal in your regular Chrome window, then continue here."], "message": "Sign in using your existing Chrome session, then continue here."}
+
+    fields = [item for item in state.get("fields", []) if isinstance(item, dict)]
+    files = [item for item in state.get("files", []) if isinstance(item, dict)]
+    application_form_found = bool(files) or any(
+        item.get("visible") and _field_value(item, payload["profile"]) is not None
+        for item in fields
+    )
+    if not application_form_found:
+        links = [item for item in state.get("links", []) if isinstance(item, dict)]
+        if len(links) != 1:
+            return {"status": "needs_manual_navigation", "filled": [], "uploaded": [], "needs_user": ["Open the application form in Chrome, then choose Continue here."], "message": "Neural Ant did not find one direct Apply link. Open the form in your regular Chrome window, then continue here."}
+        destination = str(links[0].get("href") or "")
+        if not is_public_https_url(destination) or not _allowed_application_host(page_url, destination):
+            return {"status": "unrecognized_portal", "filled": [], "uploaded": [], "needs_user": ["Review the Apply link destination in Chrome."], "message": "The Apply link opens an unrecognized site. Neural Ant left your profile and résumé unshared."}
+        client.tool("navigate_page", {"pageId": page_id, "type": "url", "url": destination, "timeout": 30000}, timeout=35)
+        pages_response = client.tool("list_pages")
+        page = next((item for item in _mcp_pages(pages_response) if int(item.get("id", -1)) == int(page_id)), None)
+        page_url = str(page.get("url") or "") if page else ""
+        if not is_public_https_url(page_url) or not _allowed_application_host(destination, page_url):
+            return {"status": "unrecognized_portal", "filled": [], "uploaded": [], "needs_user": ["Review the redirected employer portal in Chrome."], "message": "The Apply link redirected to an unrecognized site. Neural Ant left your profile and résumé unshared."}
+        state = _mcp_page_state(client, page_id)
+        if state.get("passwordCount") or any(term in str(state.get("url", "")).casefold() for term in ("/login", "sign-in", "signin", "login")):
+            return {"status": "sign_in_required", "filled": [], "uploaded": [], "needs_user": ["Sign in to the employer portal in your regular Chrome window, then continue here."], "message": "Sign in using your existing Chrome session, then continue here."}
+        fields = [item for item in state.get("fields", []) if isinstance(item, dict)]
+        files = [item for item in state.get("files", []) if isinstance(item, dict)]
+
+    operations = []
+    labels_by_index: dict[int, str] = {}
+    needs_user: list[str] = []
+    controls_to_skip = {"hidden", "password", "checkbox", "radio", "submit", "button", "reset", "image", "file"}
+    for item in fields:
+        if not item.get("visible") or item.get("disabled"):
+            continue
+        label = str(item.get("label") or "").strip()
+        match = _field_value(item, payload["profile"])
+        if match and not str(item.get("value") or "").strip() and str(item.get("type") or "").casefold() not in controls_to_skip:
+            value, source = match
+            if item.get("tag") == "select":
+                options = item.get("options") or []
+                exact = next((option for option in options if str(option.get("label", "")).casefold().strip() == value.casefold().strip()), None)
+                exact = exact or next((option for option in options if str(option.get("value", "")).casefold().strip() == value.casefold().strip()), None)
+                if exact is None:
+                    if item.get("required") and label:
+                        needs_user.append("Review required field: " + label[:120])
+                    continue
+            index = int(item.get("index", -1))
+            if index >= 0:
+                operations.append({"index": index, "value": value})
+                labels_by_index[index] = (label or source)[:80]
+        elif item.get("required") and label:
+            needs_user.append("Review required field: " + label[:120])
+
+    completed = _mcp_apply_operations(client, page_id, operations)
+    filled = list(dict.fromkeys(labels_by_index[index] for index in sorted(completed) if index in labels_by_index))
 
     uploaded: list[str] = []
-    try:
-        files = []
-        for frame in frames:
-            if frame != page.main_frame and frame.url != "about:blank" and not _allowed_application_host(page.url, frame.url):
-                continue
-            for entry in frame.locator('input[type="file"]').evaluate_all("""els => els.map((el, index) => {
-              const labels = Array.from(el.labels || []).map(node => (node.innerText || node.textContent || '').trim());
-              const parent = el.closest('label'); if (parent) labels.push((parent.innerText || parent.textContent || '').trim());
-              return {index, label:[...labels, el.name || '', el.id || '', el.getAttribute('aria-label') || ''].join(' '), accept:el.accept || ''};
-            })"""):
-                files.append({**entry, "frame": frame})
-        resume_inputs = [entry for entry in files if re.search(r"\b(resume|résumé|cv|curriculum vitae)\b", entry["label"], re.I)]
-        cover_inputs = [entry for entry in files if re.search(r"\b(cover letter|covering letter)\b", entry["label"], re.I)]
-        if len(resume_inputs) == 1 and Path(resume_path).is_file():
-            if _file_accepts_path(resume_inputs[0].get("accept", ""), resume_path):
-                resume_inputs[0]["frame"].locator('input[type="file"]').nth(int(resume_inputs[0]["index"])).set_input_files(resume_path)
-                uploaded.append("tailored resume")
-            else:
-                needs_user.append("The resume upload accepts a different file format; attach an accepted version manually.")
-        elif len(files) == 1 and not resume_inputs:
-            needs_user.append("Check the unlabeled file upload; Neural Ant left it unchanged.")
-        else:
-            needs_user.append("Resume upload field was not identified; attach the tailored resume manually if needed.")
-        if len(cover_inputs) == 1 and cover_letter_path and Path(cover_letter_path).is_file():
-            if _file_accepts_path(cover_inputs[0].get("accept", ""), cover_letter_path):
-                cover_inputs[0]["frame"].locator('input[type="file"]').nth(int(cover_inputs[0]["index"])).set_input_files(cover_letter_path)
-                uploaded.append("tailored cover letter")
-            else:
-                needs_user.append("The cover-letter upload accepts a different file format; attach an accepted version manually.")
-    except Exception:
-        needs_user.append("Check document uploads in the employer form.")
+    resume_inputs = [item for item in files if re.search(r"\b(resume|résumé|cv|curriculum vitae)\b", str(item.get("label", "")), re.I)]
+    cover_inputs = [item for item in files if re.search(r"\b(cover letter|covering letter)\b", str(item.get("label", "")), re.I)]
+    for target, matches, path_key, title in (
+        ("resume", resume_inputs, "resume_path", "tailored resume"),
+        ("cover letter", cover_inputs, "cover_letter_path", "tailored cover letter"),
+    ):
+        path = str(payload.get(path_key) or "")
+        if not path or not Path(path).is_file():
+            if target == "resume":
+                needs_user.append("Attach the tailored résumé manually if this form has an upload field.")
+            continue
+        if len(matches) != 1:
+            if target == "resume":
+                needs_user.append("Resume upload field was not identified; attach the tailored résumé manually if needed.")
+            continue
+        if not _file_accepts_path(str(matches[0].get("accept") or ""), path):
+            needs_user.append(f"The {target} upload accepts another file format; attach an accepted version manually.")
+            continue
+        uid = _upload_uid(client, page_id, target)
+        if not uid:
+            needs_user.append(f"Neural Ant could not identify the {target} upload control; attach it manually.")
+            continue
+        client.tool("upload_file", {"pageId": page_id, "uid": uid, "filePaths": [path]}, timeout=35)
+        uploaded.append(title)
 
-    human_check = _page_needs_human_verification(page)
+    all_text = (str(state.get("title") or "") + " " + str(state.get("text") or "")).casefold()
+    human_check = any(term in all_text for term in ("captcha", "i'm not a robot", "verify you are human", "human verification", "security check"))
     if human_check:
         needs_user.append("Complete the human verification in Chrome.")
     return {
         "status": "human_verification_required" if human_check else "ready",
-        "filled": list(dict.fromkeys(filled)),
+        "filled": filled,
         "uploaded": uploaded,
         "needs_user": list(dict.fromkeys(needs_user)),
-        "message": "Review the open employer form. Neural Ant will not submit it.",
+        "message": "Review the open application in your regular Chrome window. Neural Ant will not submit it.",
     }
-
-
-def _browser_profile_dir() -> Path:
-    configured = os.getenv("NEURAL_ANT_BROWSER_PROFILE", "").strip()
-    path = Path(configured).expanduser() if configured else Path.home() / ".neural-ant" / "portal-browser"
-    path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    try:
-        path.chmod(0o700)
-    except OSError:
-        pass
-    return path
-
-
-def _launch_context(playwright):
-    profile_dir = _browser_profile_dir()
-    options = {"headless": False, "accept_downloads": False, "viewport": {"width": 1365, "height": 900}}
-    system = platform.system()
-    if system == "Darwin":
-        chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
-        user_chrome = Path.home() / "Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-        if chrome.is_file() or user_chrome.is_file():
-            options["channel"] = "chrome"
-    elif system == "Windows":
-        options["channel"] = "chrome"
-    else:
-        chrome = shutil.which("google-chrome") or shutil.which("google-chrome-stable")
-        chromium = shutil.which("chromium") or shutil.which("chromium-browser")
-        if chrome:
-            options["channel"] = "chrome"
-        elif chromium:
-            options["executable_path"] = chromium
-    return playwright.chromium.launch_persistent_context(str(profile_dir), **options)
 
 
 def _set_run(run_id: str, **updates) -> None:
@@ -441,35 +649,21 @@ def _set_run(run_id: str, **updates) -> None:
             _RUNS[run_id].update(updates)
 
 
-def _worker_main() -> None:
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception:
-        while True:
-            task = _TASKS.get()
-            if task is None:
-                return
-            _set_run(task[0], status="failed", message="Browser automation is not installed. Restart Neural Ant using run-local.sh.")
-            with _RUNS_LOCK:
-                private = _RUN_PRIVATE.pop(task[0], None)
-            if private:
-                shutil.rmtree(private.get("temp_dir", ""), ignore_errors=True)
+def _cleanup_staged_run(run_id: str, payload: dict[str, Any]) -> None:
+    for key in ("resume_path", "cover_letter_path"):
+        try:
+            if payload.get(key):
+                os.unlink(payload[key])
+        except OSError:
+            pass
+    with _RUNS_LOCK:
+        _RUN_PRIVATE.pop(run_id, None)
+    shutil.rmtree(payload.get("temp_dir", ""), ignore_errors=True)
 
-    pages: dict[str, Any] = {}
-    contexts = None
-    try:
-        playwright = sync_playwright().start()
-    except Exception:
-        while True:
-            task = _TASKS.get()
-            if task is None:
-                return
-            _set_run(task[0], status="failed", message="Could not start the local browser. Restart Neural Ant and try again.")
-            with _RUNS_LOCK:
-                private = _RUN_PRIVATE.pop(task[0], None)
-            if private:
-                shutil.rmtree(private.get("temp_dir", ""), ignore_errors=True)
-    
+
+def _worker_main() -> None:
+    client: _ChromeDevtoolsClient | None = None
+    pages: dict[str, int] = {}
     try:
         while True:
             task = _TASKS.get()
@@ -477,102 +671,78 @@ def _worker_main() -> None:
                 break
             run_id, action, payload = task
             try:
-                if action == "forget":
-                    for page in list(pages.values()):
-                        try:
-                            page.close()
-                        except Exception:
-                            pass
+                if action == "disconnect":
+                    if client:
+                        client.close()
+                        client = None
                     pages.clear()
-                    if contexts:
-                        contexts.close()
-                        contexts = None
-                    with _RUNS_LOCK:
-                        staged = list(_RUN_PRIVATE.values())
-                        _RUN_PRIVATE.clear()
-                    for item in staged:
-                        shutil.rmtree(item.get("temp_dir", ""), ignore_errors=True)
-                    shutil.rmtree(_browser_profile_dir(), ignore_errors=True)
-                    _set_run(run_id, status="ready", message="Saved employer sign-ins were removed from this device.")
+                    _set_run(run_id, status="disconnected", message="Neural Ant disconnected from Chrome. Your Chrome tabs and sign-ins are still open.")
                     continue
 
-                if contexts is None:
-                    contexts = _launch_context(playwright)
-                    contexts.set_default_timeout(2500)
-                if action == "open":
-                    _set_run(run_id, status="opening", message="Opening the employer form in Chrome.")
-                    page = contexts.new_page()
-                    pages[run_id] = page
-                    page.on("popup", lambda popup, key=run_id: pages.__setitem__(key, popup))
-                    page.goto(payload["url"], wait_until="domcontentloaded", timeout=30000)
-                    if not is_public_https_url(page.url):
-                        raise RuntimeError("The posting redirected to a non-public HTTPS address.")
+                if client is None:
+                    _set_run(run_id, status="connecting_chrome", message="Connecting to your regular Chrome. Approve Neural Ant's access prompt if Chrome shows one.")
                     try:
-                        page.wait_for_timeout(700)
-                    except Exception:
-                        pass
-                    nav_note = ""
-                    if not _page_has_auth_gate(page):
-                        page, nav_note = _maybe_open_application(page, contexts)
-                        pages[run_id] = page
-                    result = fill_application_page(page, payload["profile"], payload["resume_path"], payload.get("cover_letter_path", ""), payload["url"])
-                    if nav_note:
-                        result["needs_user"].append(nav_note)
-                        result["status"] = "needs_manual_navigation"
-                    if result["status"] not in {"sign_in_required", "needs_manual_navigation"}:
-                        try:
-                            os.unlink(payload["resume_path"])
-                        except OSError:
-                            pass
-                        if payload.get("cover_letter_path"):
-                            try:
-                                os.unlink(payload["cover_letter_path"])
-                            except OSError:
-                                pass
-                        with _RUNS_LOCK:
-                            _RUN_PRIVATE.pop(run_id, None)
-                        shutil.rmtree(payload.get("temp_dir", ""), ignore_errors=True)
-                    _set_run(run_id, **result, url=page.url, host=urlsplit(page.url).hostname or "")
+                        client = _ChromeDevtoolsClient(on_wait=lambda: _set_run(
+                            run_id,
+                            status="connecting_chrome",
+                            message="Waiting for Chrome's permission prompt. Approve Neural Ant in your regular Chrome window.",
+                        ))
+                    except ChromeConnectionError as exc:
+                        _set_run(
+                            run_id,
+                            status="chrome_setup_required",
+                            message=str(exc) or "Enable Remote Debugging in your regular Chrome, then retry.",
+                            needs_user=["In Chrome, open chrome://inspect/#remote-debugging and enable Remote Debugging. Then approve Neural Ant's permission prompt."],
+                        )
+                        continue
+
+                if action == "open" or (action == "continue" and run_id not in pages):
+                    before = _mcp_pages(client.tool("list_pages"))
+                    before_ids = {int(item.get("id", -1)) for item in before}
+                    _set_run(run_id, status="connecting_chrome", message="Connecting to your regular Chrome and opening the employer form. Approve Neural Ant's access prompt if it appears.")
+                    created = client.tool("new_page", {"url": payload["url"], "background": False, "timeout": 120000}, timeout=130)
+                    candidates = _mcp_pages(created)
+                    target = next((item for item in candidates if int(item.get("id", -1)) not in before_ids), None)
+                    target = target or next((item for item in candidates if str(item.get("url") or "").startswith(payload["url"])), None)
+                    if target is None:
+                        latest = _mcp_pages(client.tool("list_pages"))
+                        target = next((item for item in latest if int(item.get("id", -1)) not in before_ids), None)
+                    if target is None:
+                        latest = _mcp_pages(client.tool("list_pages"))
+                        target = next((item for item in latest if str(item.get("url") or "").startswith(payload["url"])), None)
+                    if not target or target.get("id") is None:
+                        raise RuntimeError("Chrome did not return the new application tab.")
+                    page_id = int(target["id"])
+                    pages[run_id] = page_id
                 elif action == "continue":
-                    page = pages.get(run_id)
-                    if page is None or page.is_closed():
-                        raise RuntimeError("The review tab is no longer open. Prepare this application again to reopen it.")
-                    result = fill_application_page(page, payload["profile"], payload["resume_path"], payload.get("cover_letter_path", ""), payload["url"])
-                    if result["status"] != "sign_in_required":
-                        for key in ("resume_path", "cover_letter_path"):
-                            try:
-                                if payload.get(key):
-                                    os.unlink(payload[key])
-                            except OSError:
-                                pass
-                        with _RUNS_LOCK:
-                            _RUN_PRIVATE.pop(run_id, None)
-                        shutil.rmtree(payload.get("temp_dir", ""), ignore_errors=True)
-                    _set_run(run_id, **result, url=page.url, host=urlsplit(page.url).hostname or "")
+                    page_id = pages[run_id]
+                else:
+                    continue
+
+                _set_run(run_id, status="opening", message="Checking the employer form in your regular Chrome.")
+                result = _fill_connected_chrome_page(client, page_id, payload)
+                page_response = client.tool("list_pages")
+                current = next((item for item in _mcp_pages(page_response) if int(item.get("id", -1)) == page_id), {})
+                page_url = str(current.get("url") or result.get("url") or payload["url"])
+                result.pop("url", None)
+                if result.get("status") not in {"sign_in_required", "needs_manual_navigation", "chrome_setup_required"}:
+                    _cleanup_staged_run(run_id, payload)
+                _set_run(run_id, **result, url=page_url, host=urlsplit(page_url).hostname or "")
             except Exception as exc:
-                message = str(exc).splitlines()[0][:240] or "Could not open the application form."
-                if "Executable doesn't exist" in message or "browserType.launch" in message:
-                    message = "No supported browser was found. Run Neural Ant with Chrome installed or install Playwright Chromium using run-local.sh."
-                with _RUNS_LOCK:
-                    private = _RUN_PRIVATE.pop(run_id, None)
-                if private:
-                    shutil.rmtree(private.get("temp_dir", ""), ignore_errors=True)
-                _set_run(run_id, status="failed", message=message)
+                message = str(exc).splitlines()[0][:360] or "Could not prepare the employer form in Chrome."
+                if any(term in message.casefold() for term in ("connection", "connect", "browser is not", "not connected", "remote debugging")):
+                    _set_run(run_id, status="chrome_setup_required", message="Neural Ant could not reach your regular Chrome. Enable Remote Debugging in Chrome's inspect settings, then retry.", needs_user=[message])
+                else:
+                    _set_run(run_id, status="failed", message=message)
+                if run_id in pages and _RUNS.get(run_id, {}).get("status") == "failed":
+                    pages.pop(run_id, None)
     finally:
-        if contexts:
-            try:
-                contexts.close()
-            except Exception:
-                pass
+        if client:
+            client.close()
         with _RUNS_LOCK:
-            staged = list(_RUN_PRIVATE.values())
-            _RUN_PRIVATE.clear()
-        for item in staged:
-            shutil.rmtree(item.get("temp_dir", ""), ignore_errors=True)
-        try:
-            playwright.stop()
-        except Exception:
-            pass
+            staged = list(_RUN_PRIVATE.items())
+        for run_id, payload in staged:
+            _cleanup_staged_run(run_id, payload)
 
 
 def _ensure_worker() -> None:
@@ -629,7 +799,7 @@ def start_portal_run(*, application_id: int, job: Any, profile: dict[str, Any], 
             "filled": [],
             "uploaded": [],
             "needs_user": [],
-            "message": "Opening the employer form in a separate Chrome tab.",
+            "message": "Opening the employer form in a new tab in your regular Chrome.",
             "url": str(job.url or ""),
         }
     payload = {
@@ -651,9 +821,9 @@ def continue_portal_run(run_id: str) -> dict[str, Any] | None:
         current = _RUNS.get(run_id)
         if not current:
             return None
-        if current.get("status") not in {"sign_in_required", "human_verification_required", "ready", "needs_manual_navigation"}:
+        if current.get("status") not in {"chrome_setup_required", "sign_in_required", "human_verification_required", "ready", "needs_manual_navigation"}:
             return dict(current)
-        current.update(status="queued", message="Continuing form preparation in Chrome.")
+        current.update(status="queued", message="Continuing form preparation in your regular Chrome.")
     private = _RUN_PRIVATE.get(run_id)
     if not private:
         return get_portal_run(run_id)
@@ -667,12 +837,16 @@ def get_portal_run(run_id: str) -> dict[str, Any] | None:
         return dict(current) if current else None
 
 
-def forget_portal_sessions() -> dict[str, Any]:
-    run_id = "forget-" + uuid.uuid4().hex
+def disconnect_portal_browser() -> dict[str, Any]:
+    run_id = "disconnect-" + uuid.uuid4().hex
     with _RUNS_LOCK:
-        _RUNS[run_id] = {"run_id": run_id, "status": "queued", "message": "Removing saved browser sign-ins."}
+        _RUNS[run_id] = {"run_id": run_id, "status": "queued", "message": "Disconnecting Neural Ant from Chrome."}
     _ensure_worker()
-    _TASKS.put((run_id, "forget", {}))
+    _TASKS.put((run_id, "disconnect", {}))
     return get_portal_run(run_id) or {}
+
+
+def open_chrome_settings() -> dict[str, Any]:
+    return open_chrome_remote_debugging_settings()
 
 
