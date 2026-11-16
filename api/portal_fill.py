@@ -228,6 +228,22 @@ class ChromeConnectionError(RuntimeError):
     """Chrome is not yet available for an explicitly approved local session."""
 
 
+def _macos_chrome_profile_access_guidance(error: str) -> str | None:
+    """Explain the macOS Files & Folders grant needed by Chrome auto-connect."""
+    lowered = str(error).casefold()
+    profile_endpoint = "devtoolsactiveport" in lowered and (
+        "google/chrome" in lowered or "application support/google/chrome" in lowered
+    )
+    denied = any(term in lowered for term in ("eperm", "operation not permitted", "permission denied"))
+    if profile_endpoint and denied:
+        return (
+            "Chrome Remote Debugging is on, but macOS is blocking the Neural Ant host app from reading Chrome's local connection file. "
+            "Open System Settings > Privacy & Security > Files & Folders, find Codex (the app running Neural Ant), and allow Google Chrome. "
+            "Then retry. This is separate from Chrome's Remote Debugging switch."
+        )
+    return None
+
+
 class _ChromeDevtoolsClient:
     """Minimal stdio MCP client for the official Chrome DevTools MCP server."""
 
@@ -729,9 +745,13 @@ def _worker_main() -> None:
                     _cleanup_staged_run(run_id, payload)
                 _set_run(run_id, **result, url=page_url, host=urlsplit(page_url).hostname or "")
             except Exception as exc:
-                message = str(exc).splitlines()[0][:360] or "Could not prepare the employer form in Chrome."
-                if any(term in message.casefold() for term in ("connection", "connect", "browser is not", "not connected", "remote debugging")):
-                    _set_run(run_id, status="chrome_setup_required", message="Neural Ant could not reach your regular Chrome. Enable Remote Debugging in Chrome's inspect settings, then retry.", needs_user=[message])
+                error_detail = str(exc).strip()
+                message = error_detail.splitlines()[0][:360] or "Could not prepare the employer form in Chrome."
+                macos_access_message = _macos_chrome_profile_access_guidance(error_detail)
+                if macos_access_message:
+                    _set_run(run_id, status="chrome_setup_required", message=macos_access_message, needs_user=[macos_access_message])
+                elif any(term in message.casefold() for term in ("connection", "connect", "browser is not", "not connected", "remote debugging")):
+                    _set_run(run_id, status="chrome_setup_required", message=message, needs_user=[message])
                 else:
                     _set_run(run_id, status="failed", message=message)
                 if run_id in pages and _RUNS.get(run_id, {}).get("status") == "failed":

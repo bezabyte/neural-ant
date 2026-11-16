@@ -199,6 +199,16 @@ for line in sys.stdin:
         self.assertEqual(args[-1], "chrome://inspect/#remote-debugging")
         self.assertNotIn("--user-data-dir", args)
 
+    def test_macos_chrome_profile_permission_failure_has_specific_fix(self):
+        guidance = portal_fill._macos_chrome_profile_access_guidance(
+            "Could not connect to Chrome. Cause: Could not read DevToolsActivePort for chrome at "
+            "/Users/josh/Library/Application Support/Google/Chrome/DevToolsActivePort: permission denied; EPERM"
+        )
+        self.assertIsNotNone(guidance)
+        self.assertIn("Privacy & Security > Files & Folders", guidance)
+        self.assertIn("allow Google Chrome", guidance)
+        self.assertIsNone(portal_fill._macos_chrome_profile_access_guidance("Chrome remote debugging is not enabled"))
+
 
 if __name__ == "__main__":
     unittest.main()
