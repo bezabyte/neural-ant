@@ -27,14 +27,14 @@
 
 ## How it works
 
-The Chat page combines the reference workflow—`/setup → /scrape → /rank → /apply`—in one action. Upload a PDF or DOCX resume, verify the extracted profile, then choose **Find & prepare jobs**. The workflow uses a fixed, allowlisted execution plan: independent searches and role packs run concurrently with limits, while dependent steps stay ordered. **A/B timing** lets you compare planned execution with a sequential baseline; timing history stays in the browser and stores durations and counts only.
+The Chat page combines the reference workflow—`/setup → /scrape → /rank → /apply`—into a short flow. Upload a PDF or DOCX resume and Neural Ant starts matching searches automatically; **Search again** reruns them later. Independent job sources run in parallel, then listings are ranked against the saved profile. Select up to five roles and prepare them in one batch, or prepare a single role from its card. Each saved review pack includes a role-specific resume and cover letter plus copy-ready profile facts. Employer forms, legal attestations, and final submission stay with you. **A/B timing** compares the same search plan in parallel and sequential modes; timing history stays in the browser and stores durations and counts only.
 
 | Step | What Neural Ant does |
 |---|---|
 | **Set up** | Extracts supported profile and application-history details from your resume for you to verify. |
 | **Find** | Searches configured public job boards and a live remote tech-job index. |
 | **Rank** | Scores role fit and keeps eligibility, language, location, work mode, contract type, and sponsorship evidence visible. |
-| **Prepare** | Creates reviewable, job-specific resume and cover-letter drafts for up to five top-fit remote roles whose postings explicitly mention sponsorship. |
+| **Prepare** | After you select roles, creates reviewable, job-specific resume and cover-letter drafts plus saved-profile facts, in batches of up to five. |
 | **You apply** | You review the listing and drafts, then complete and submit the employer application yourself. |
 
 Slash commands remain available for individual steps: `/setup`, `/scrape`, `/rank`, `/apply`, `/interview`, and `/outcome`. `/help` shows the command list. These commands open Neural Ant's feature screens; the command box is not a general-purpose chatbot.
@@ -45,8 +45,8 @@ Slash commands remain available for individual steps: `/setup`, `/scrape`, `/ran
 - **Understand each match:** ranking uses technical skills (30%), experience (25%), work-style fit (15%), and career alignment (30%), with separate eligibility, language, and location gates. Scores are ranking aids, not ATS scores or hiring predictions.
 - **Keep sponsorship evidence specific:** role language and historical employer filings are displayed separately. A past H-1B/LCA filing does not promise sponsorship for a particular opening. C2C is tracked as an employment type; it does not establish visa sponsorship.
 - **Review before using AI drafting:** local drafts reorder existing resume content. An external AI provider is optional and requires an explicit opt-in; Neural Ant applies best-effort redaction before sending selected resume, profile, and job details. Review every generated document for accuracy.
-- **Measure workflow speed:** the planned run prepares up to two role packs in parallel and combines them in one backend request. External AI drafting runs independent resume/cover-letter calls together, then runs the independent revisions together. The sequential baseline is available from **A/B timing**. Its sequential estimate is calculated from the current run's task durations, so treat it as a directional comparison rather than a controlled benchmark.
-- **Track the search:** shortlist roles, record stages and outcomes, save interview prep and follow-up drafts, and exclude completed or duplicate roles from future one-click preparation.
+- **Measure workflow speed:** independent board and public-index searches overlap. The backend prepares up to two selected role packs at once and accepts a batch of up to five in one request. External AI drafting runs independent resume/cover-letter calls together, then runs the independent revisions together. The sequential baseline is available from **A/B timing**. Its sequential estimate is calculated from the current run's task durations, so treat it as a directional comparison rather than a controlled benchmark.
+- **Track the search:** shortlist roles, record stages and outcomes, save interview prep and follow-up drafts, and exclude completed or duplicate roles from future matching results and preparation.
 - **Use your own files and accounts:** optional MCP tools can search saved listings without exposing resume text or contact details. Email-status review works from messages you choose to paste; Notion export is a one-way CSV.
 
 ## Quick start
@@ -59,7 +59,7 @@ cd neural-ant
 bash run-local.sh
 ```
 
-On the first run, the script installs dependencies, builds the interface, and creates a local SQLite database. Open [http://127.0.0.1:8080](http://127.0.0.1:8080), upload your resume in **My profile**, confirm the extracted details, then configure employer boards under **Agent search**. Stop the app from Terminal with **Ctrl+C**.
+On the first run, the script installs dependencies, builds the interface, and creates a local SQLite database. Open [http://127.0.0.1:8080](http://127.0.0.1:8080), upload your resume on **Home**, review the extracted profile, then configure employer boards under **Find roles** if needed. Upload starts search automatically. Stop the app from Terminal with **Ctrl+C**.
 
 Local mode stores the database and resume under `data/` and listens on your Mac only. It runs while the Mac and terminal process are active. Do not expose the local server to a network.
 

@@ -17,9 +17,12 @@ The code-mode transcript reports lower token use and cost in its own evaluation 
 - Kept the deterministic, allowlisted workflow plan. Board search and the broad index search already run concurrently; ranking waits for both, and document preparation remains bounded. The flow is predictable and does not execute model-generated code.
 - Reused a bounded HTTP connection pool for employer boards, the public index, and opted-in AI calls.
 - Replaced per-listing sponsor and existing-job lookups with one sponsor index and bounded URL batches in board search, broad-index search, and profile score refresh.
-- Removed the post-preparation tracker reload. Opening Applications still loads fresh tracker data when the user asks to review it.
+- Removed the extra tracker reload from single-role preparation; it returns the saved draft preview directly. Batch preparation opens Applications and loads its two independent data sets in parallel.
 - Parallelized independent profile, tracker, and status requests during app initialization, and reused the profile response to populate the broad-index query.
 - Added server fetch / persistence timings and recorded board, index, ranking, and preparation durations locally. Stored timing data contains counts and durations only.
+- Resume upload now starts search automatically. Board and public-index searches overlap in a fixed workflow plan; ranking waits for both and then loads saved, profile-scored matches.
+- Replaced automatic preparation of top roles with an explicit one-role action and a five-role batch selector. One backend request creates/reuses the selected drafts and keeps completed roles skipped. The single-role action returns a preview and saved-profile facts; the batch path keeps large document text out of the response and presents saved files in Applications. New draft generation remains bounded to two concurrent roles.
+- Added copy-ready application facts and a local text sheet for later manual portal entry. Legal work-authorization attestations, salary/EEO, signatures, CAPTCHA and role-specific questions remain for the user.
 
 ## Before and after
 
@@ -28,7 +31,11 @@ The code-mode transcript reports lower token use and cost in its own evaluation 
 | Search database reads | Each posting checked its URL and sponsor record separately. | Existing URLs and relevant sponsor records are loaded in bounded batches. |
 | Outbound connections | Search created a new HTTP client for each board; the index and each AI request also used short-lived clients. | Board, index, and optional AI requests reuse a bounded keep-alive pool. |
 | App initialization | Profile, index-query setup, tracker, jobs, and status requests waited in sequence. | Independent profile, tracker, and status requests run together; the loaded profile supplies the index query. |
-| After draft prep | The browser fetched applications and jobs again before showing the ready result. | Those two reads wait until the user opens Applications. |
+| Single-role draft prep | The browser made separate tracker, jobs, and tailoring requests before it could show a draft. | One batch-prepare request returns the preview and profile facts directly. |
+| Batch review | Draft content would be returned redundantly for every selected role. | The batch stores all documents, then Applications loads tracker and job data in parallel and provides per-role downloads. |
+| Upload to search | Resume upload populated profile data, but waited for a separate search action. | Upload now triggers the saved-source and public-index searches automatically. |
+| Choosing roles | One-click search automatically generated drafts for the top five. | The user chooses a posting or selects up to five; an explicit batch action saves all selected packs together for review. |
+| Review-pack requests | A per-role path required several browser/API calls before a draft could be reviewed. | The selected-role batch uses one prepare request and returns the pack preview and copy-ready profile facts in its response. |
 | Timing evidence | The UI showed total phase durations and a directional sequential estimate. | Search APIs expose fetch and local processing time; the browser stores phase durations and counts, still on-device. |
 
 ## More transcript lessons and best next moves
@@ -43,7 +50,7 @@ The transcripts mention Arize Phoenix/Harbor and MLflow for traces and evaluatio
 
 ## Benchmark and limits
 
-A local synthetic run with 6 stubbed employer boards and 240 postings saved all listings in 347 ms on SQLite. The prior implementation made up to 480 listing-by-listing reads for those postings (one existing-URL lookup and one sponsor lookup per row); the new path made 2 matching reads total: one batched URL lookup and one batched sponsor lookup. External network latency and AI-provider latency were stubbed, so 347 ms is not a production end-to-end promise.
+A local synthetic run with 6 stubbed employer boards and 240 postings saved all listings in 347 ms on SQLite. The prior implementation made up to 480 listing-by-listing reads for those postings (one existing-URL lookup and one sponsor lookup per row); the new path made 2 matching reads total: one batched URL lookup and one batched sponsor lookup. The synthetic search A/B test used two independent sources (90 ms and 105 ms) followed by dependent ranking. In the recorded run, planned mode took 106 ms and sequential mode took 197 ms (about 46% lower wall time); both returned the same two matches. External network latency and AI-provider latency were stubbed, so neither synthetic result is a production end-to-end promise.
 
 For real runs, compare the full click-to-review time and inspect board fetch, index fetch, local persistence/scoring, ranking, and preparation. Draft reuse, number of roles, network conditions, and optional external AI change the result. The browser's sequential estimate is directional, not a controlled benchmark.
 

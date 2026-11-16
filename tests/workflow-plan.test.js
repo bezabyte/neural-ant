@@ -56,6 +56,49 @@ test('sequential mode never overlaps ready steps', async () => {
   assert.equal(state.peak, 1);
 });
 
+test('A/B: planned search returns the same matches faster than the sequential baseline', async () => {
+  async function run(mode) {
+    const state = { active: 0, peak: 0 };
+    const sourceStep = (id, waitMs) => ({
+      id,
+      run: async () => {
+        state.active += 1;
+        state.peak = Math.max(state.peak, state.active);
+        try {
+          await new Promise(resolve => setTimeout(resolve, waitMs));
+          return ['role-a', 'role-b'];
+        } finally {
+          state.active -= 1;
+        }
+      },
+    });
+    const plan = [
+      sourceStep('boards', 90),
+      sourceStep('index', 105),
+      {
+        id: 'rank',
+        dependsOn: ['boards', 'index'],
+        run: async ({ results }) => [...new Set([...results.boards, ...results.index])].sort(),
+      },
+    ];
+    const started = performance.now();
+    const execution = await executeWorkflowPlan(plan, { mode, maxConcurrency: 2 });
+    return {
+      matches: execution.results.rank,
+      wallMs: Math.round(performance.now() - started),
+      peak: state.peak,
+    };
+  }
+
+  const planned = await run('planned');
+  const sequential = await run('sequential');
+  assert.deepEqual(planned.matches, sequential.matches);
+  assert.equal(planned.peak, 2);
+  assert.equal(sequential.peak, 1);
+  assert.ok(planned.wallMs < sequential.wallMs, `${planned.wallMs}ms should beat ${sequential.wallMs}ms`);
+  console.log(`Synthetic search A/B: planned ${planned.wallMs}ms, sequential ${sequential.wallMs}ms; both returned ${planned.matches.length} identical matches.`);
+});
+
 test('rejects duplicate ids, unknown dependencies, and cycles', async () => {
   const noop = async () => 'ok';
   await assert.rejects(

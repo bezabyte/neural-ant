@@ -40,6 +40,8 @@ class BatchPrepareEndpointTests(unittest.TestCase):
             profile.update({
                 "name": "Smoke Test Candidate",
                 "preferred_name": "Smoke Test Candidate",
+                "email": "candidate@example.test",
+                "work_authorization": "OPT; needs future H-1B sponsorship",
                 "target_titles": ["AI Engineer"],
                 "skills": ["Python", "AWS", "FastAPI"],
                 "years_experience": 5,
@@ -126,6 +128,26 @@ class BatchPrepareEndpointTests(unittest.TestCase):
             self.assertEqual(len(drafts), 1)
             self.assertEqual(drafts[0].job_id, 1)
 
+    def test_prepare_returns_review_pack_and_copy_ready_facts_without_submission(self):
+        response = self.post_batch([1], include_preview=True)
+        self.assertEqual(response.status_code, 200, response.text)
+        payload = response.json()
+        role = payload["roles"][0]
+        self.assertEqual(role["status"], "prepared")
+        self.assertIn("Built cloud services", role["draft_preview"]["content"])
+        self.assertIn("Dear Hiring Manager", role["draft_preview"]["cover_letter"])
+        fields = {field["label"]: field for field in payload["application_answers"]}
+        self.assertEqual(fields["Full name"]["value"], "Smoke Test Candidate")
+        self.assertEqual(fields["Email"]["value"], "candidate@example.test")
+        self.assertEqual(fields["Work authorization / sponsorship statement"]["status"], "review")
+        self.assertTrue(any("Answer legal work-authorization" in item for item in payload["manual_review"]))
+
+        downloaded = self.request_json("GET", f"/api/applications/{role['application_id']}/answers")
+        self.assertEqual(downloaded.status_code, 200)
+        self.assertIn("Smoke Test Candidate", downloaded.text)
+        self.assertIn("ANSWER THESE YOURSELF IN THE EMPLOYER FORM", downloaded.text)
+        self.assertIn("does not fill or submit", downloaded.text)
+
     def test_hard_fit_gate_blocks_draft_creation(self):
         with appmod.SessionLocal() as db:
             job = db.get(appmod.JobRow, 5)
@@ -161,11 +183,26 @@ class BatchPrepareEndpointTests(unittest.TestCase):
         self.assertEqual(planned.status_code, 200, planned.text)
         self.assertEqual(planned.json()["max_concurrency"], 2)
         self.assertEqual(planned_peak, 2)
+        self.assertEqual([role["status"] for role in planned.json()["roles"]], ["prepared", "prepared", "prepared"])
 
         sequential, sequential_peak = run_and_measure([4, 5], "sequential")
         self.assertEqual(sequential.status_code, 200, sequential.text)
         self.assertEqual(sequential.json()["max_concurrency"], 1)
         self.assertEqual(sequential_peak, 1)
+
+    def test_bulk_prepare_saves_each_selected_role_for_later_review(self):
+        def fake_draft(*args, **kwargs):
+            return {"content": "resume draft", "cover_letter": "letter draft", "review_notes": "review", "model": "test"}
+
+        with patch.object(appmod, "build_application_draft", side_effect=fake_draft):
+            response = self.post_batch([1, 2], execution_mode="planned")
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual([role["status"] for role in response.json()["roles"]], ["prepared", "prepared"])
+        with appmod.SessionLocal() as db:
+            drafts = db.scalars(select(appmod.DraftRow).where(appmod.DraftRow.job_id.in_([1, 2]))).all()
+            applications = db.scalars(select(appmod.ApplicationRow).where(appmod.ApplicationRow.job_id.in_([1, 2]))).all()
+            self.assertEqual(len(drafts), 2)
+            self.assertEqual(len(applications), 2)
 
     def test_board_refresh_bulk_loads_existing_jobs_and_sponsor_evidence(self):
         fixtures = [

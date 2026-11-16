@@ -1379,6 +1379,90 @@ def serialize_application(item: ApplicationRow) -> dict[str, Any]:
     }
 
 
+def application_answer_fields(profile: dict[str, Any]) -> list[dict[str, str]]:
+    """Build copy-ready, resume-grounded form facts without inventing answers."""
+    address = ", ".join(
+        part for part in (
+            str(profile.get("address_line1") or "").strip(),
+            str(profile.get("address_line2") or "").strip(),
+            ", ".join(part for part in (
+                str(profile.get("city") or "").strip(),
+                str(profile.get("state") or "").strip(),
+                str(profile.get("postal_code") or "").strip(),
+            ) if part),
+            str(profile.get("country") or "").strip(),
+        ) if part
+    )
+
+    def join_values(value: Any) -> str:
+        if isinstance(value, list):
+            rendered = []
+            for item in value:
+                if isinstance(item, dict):
+                    rendered.append(" — ".join(str(part).strip() for part in item.values() if str(part or "").strip()))
+                elif str(item or "").strip():
+                    rendered.append(str(item).strip())
+            return "; ".join(rendered)
+        return str(value or "").strip()
+
+    rows = [
+        ("Full name", profile.get("preferred_name") or profile.get("name"), "profile"),
+        ("Email", profile.get("email"), "profile"),
+        ("Phone", profile.get("phone"), "profile"),
+        ("Location", profile.get("location") or address, "profile"),
+        ("LinkedIn", profile.get("linkedin_url"), "profile"),
+        ("GitHub", profile.get("github_url"), "profile"),
+        ("Portfolio / website", profile.get("portfolio_url") or profile.get("website_url"), "profile"),
+        ("Current employer", profile.get("current_company"), "profile"),
+        ("Current title", profile.get("role"), "profile"),
+        ("Education", profile.get("education") or join_values(profile.get("education_history")), "profile"),
+        ("Employment history", join_values(profile.get("employment_history")), "profile"),
+        ("Skills", join_values(profile.get("skills")), "profile"),
+        ("Languages", join_values(profile.get("languages")), "profile"),
+        ("Certifications", join_values(profile.get("certifications")), "profile"),
+        ("Work authorization / sponsorship statement", profile.get("work_authorization") or profile.get("sponsorship_preferences"), "review"),
+        ("Relocation preference", profile.get("relocation_preference"), "review"),
+        ("Travel preference", profile.get("travel_preference"), "review"),
+        ("Availability / notice period", " · ".join(part for part in (
+            str(profile.get("availability_date") or "").strip(),
+            str(profile.get("notice_period") or "").strip(),
+        ) if part), "review"),
+    ]
+    return [
+        {
+            "label": label,
+            "value": str(value or "").strip(),
+            "status": "missing" if not str(value or "").strip() else "review" if review == "review" else "ready",
+        }
+        for label, value, review in rows
+    ]
+
+
+def application_answer_sheet_text(profile: dict[str, Any], job: JobRow) -> str:
+    fields = application_answer_fields(profile)
+    lines = [
+        f"APPLICATION DETAILS — {job.title} at {job.company_name}",
+        "",
+        "Saved profile details. Check each value against the employer's form before using it.",
+        "",
+    ]
+    for field in fields:
+        value = field["value"] or "[Not saved in Neural Ant — answer manually]"
+        marker = " [REVIEW]" if field["status"] == "review" else "" if field["status"] == "ready" else " [MISSING]"
+        lines.append(f"{field['label']}{marker}: {value}")
+    lines.extend([
+        "",
+        "ANSWER THESE YOURSELF IN THE EMPLOYER FORM",
+        "- Legal work-authorization and sponsorship yes/no attestations",
+        "- Salary expectations unless you have saved a specific answer",
+        "- Voluntary EEO / demographic questions, legal acknowledgements, and signatures",
+        "- CAPTCHAs, identity checks, and any role-specific question not covered above",
+        "",
+        "This sheet is a local copy aid. It does not fill or submit the employer's form.",
+    ])
+    return "\n".join(lines)
+
+
 def make_application_archive_snapshot(item: ApplicationRow, db: Session) -> dict[str, Any]:
     """Freeze the posting and latest prepared documents when a user resolves a role."""
     existing = dict(item.archive_snapshot or {})
@@ -1579,6 +1663,7 @@ class BatchPrepareBody(BaseModel):
     use_external_ai: bool = False
     external_ai_confirmed: bool = False
     execution_mode: str = Field(default="planned", pattern=r"^(planned|sequential)$")
+    include_preview: bool = False
 
 
 class ManualJobItem(BaseModel):
@@ -2124,6 +2209,8 @@ def search_now(days: int = 14, _: None = Depends(require_auth), db: Session = De
 
 def freehire_profile_query(profile: dict[str, Any]) -> str:
     titles = [str(title).strip().replace('"', "") for title in profile.get("target_titles", []) if str(title).strip()]
+    if not titles and str(profile.get("role") or "").strip():
+        titles = [str(profile["role"]).strip().replace('"', "")]
     titles = titles[:5]
     if not titles:
         return 'title:"AI engineer" OR title:"machine learning engineer"'
@@ -2478,6 +2565,21 @@ def list_stale_applications(days: int = 60, _: None = Depends(require_auth), db:
     rows = db.scalars(select(ApplicationRow).where(ApplicationRow.stage.notin_(("Archived", "Done", "Applied")), ApplicationRow.outcome == "").order_by(ApplicationRow.updated_at.asc())).all()
     stale = [serialize_application(row) | {"age_days": application_age_days(row.updated_at)} for row in rows if application_age_days(row.updated_at) >= days]
     return {"days": days, "count": len(stale), "applications": stale}
+
+
+@app.get("/api/applications/{application_id}/answers")
+def download_application_answers(application_id: int, _: None = Depends(require_auth), db: Session = Depends(get_db)):
+    application = db.get(ApplicationRow, application_id)
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found.")
+    profile = ensure_profile(db).data or DEFAULT_PROFILE
+    filename = resume_filename(profile, application.job).removesuffix(".docx") + "_application_details.txt"
+    content = application_answer_sheet_text(profile, application.job)
+    return Response(
+        content=content,
+        media_type="text/plain; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.post("/api/applications/{application_id}/interview-prep")
@@ -3339,11 +3441,30 @@ def batch_prepare_applications(body: BatchPrepareBody, _: None = Depends(require
                 }
         db.commit()
 
+    role_results = [results[job_id] for job_id in job_ids]
+    if body.include_preview:
+        for outcome in role_results:
+            draft_id = outcome.get("draft_id")
+            draft = db.get(DraftRow, draft_id) if draft_id else None
+            if draft:
+                outcome["draft_preview"] = {
+                    "content": draft.content,
+                    "cover_letter": draft.cover_letter or "",
+                    "review_notes": draft.review_notes or "",
+                    "model": draft.model,
+                }
+
     return {
         "execution_mode": body.execution_mode,
         "max_concurrency": max_workers,
         "elapsed_ms": round((perf_counter() - started) * 1000),
-        "roles": [results[job_id] for job_id in job_ids],
+        "roles": role_results,
+        "application_answers": application_answer_fields(profile) if body.include_preview else None,
+        "manual_review": [
+            "Check every saved profile value before copying it into the employer form.",
+            "Answer legal work-authorization and sponsorship attestations, salary questions, EEO items, signatures, and CAPTCHAs yourself.",
+            "Employer portal forms are not automatically filled or submitted by this workflow.",
+        ] if body.include_preview else None,
         "warning": "Drafts only. Review every claim and complete employer applications yourself.",
     }
 
