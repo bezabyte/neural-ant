@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import logging
 import os
 import platform
 import queue
@@ -22,7 +23,7 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import parse_qs, urljoin, urlsplit
 
 
 _RUNS: dict[str, dict[str, Any]] = {}
@@ -33,6 +34,7 @@ _MAX_RUNS = 100
 _RUN_PRIVATE: dict[str, dict[str, Any]] = {}
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _CHROME_MCP_BIN = _REPO_ROOT / "node_modules" / ".bin" / "chrome-devtools-mcp"
+_LOGGER = logging.getLogger("neural-ant.portal-fill")
 _ATS_HOSTS = (
     "greenhouse.io", "lever.co", "ashbyhq.com", "smartrecruiters.com", "workable.com",
     "myworkdayjobs.com", "workday.com", "icims.com", "jobvite.com", "successfactors.com",
@@ -512,10 +514,11 @@ def _mcp_page_state(client: _ChromeDevtoolsClient, page_id: int) -> dict[str, An
             index, label: [labelsFor(el), el.name || '', el.id || '', el.getAttribute('data-testid') || ''].filter(Boolean).join(' '),
             accept: el.accept || '', visible: visible(el), disabled: !!el.disabled
           }));
-          const links = Array.from(document.querySelectorAll('a[href]')).map(el => ({
-            text: clean(el.innerText || el.getAttribute('aria-label')), href: el.href,
+          const applyLabel = /^(apply|apply now|apply online|apply for this job|apply to this job|apply to role|start application)$/i;
+          const links = Array.from(document.querySelectorAll('a[href], a:not([href]), button, [role="link"], [role="button"]')).map(el => ({
+            text: clean(el.innerText || el.getAttribute('aria-label')), href: el.getAttribute('href') ? el.href : '',
             visible: visible(el), inForm: !!el.closest('form')
-          })).filter(el => el.visible && !el.inForm && /^(apply|apply now|apply online|apply for this job|apply to this job|apply to role|start application)$/i.test(el.text.replace(/[›>↗]+$/g, '').trim()));
+          })).filter(el => el.visible && !el.inForm && applyLabel.test(el.text.replace(/[›>↗]+$/g, '').trim()));
           return {url: location.href, title: document.title, text: clean(document.body?.innerText).slice(0, 18000),
             passwordCount: document.querySelectorAll('input[type=password]').length, fields, files, links};
         }""",
@@ -582,6 +585,25 @@ def _flatten_accessibility_nodes(value: Any) -> list[dict[str, Any]]:
 def _is_generic_yc_apply_url(value: str) -> bool:
     parsed = urlsplit(value)
     return (parsed.hostname or "").casefold() in {"ycombinator.com", "www.ycombinator.com"} and parsed.path.rstrip("/").casefold() == "/apply"
+
+
+def _yc_profile_application_url(posting_url: str, page_url: str) -> str | None:
+    """Resolve YC's role-specific profile route after its intermediate role page."""
+    posting_host = (urlsplit(posting_url).hostname or "").casefold()
+    parsed = urlsplit(page_url)
+    host = (parsed.hostname or "").casefold()
+    if posting_host not in {"www.ycombinator.com", "ycombinator.com"} or host not in {"www.workatastartup.com", "workatastartup.com"}:
+        return None
+    path = parsed.path.rstrip("/") or "/"
+    query = parse_qs(parsed.query)
+    role_id = (query.get("signup_job_id") or [""])[0]
+    if not role_id and path.startswith("/jobs/"):
+        match = re.fullmatch(r"/jobs/(\d+)", path)
+        role_id = match.group(1) if match else ""
+    eligible_route = path.startswith("/jobs/") or (path == "/" and "signup_job_id" in query)
+    if not eligible_route or not re.fullmatch(r"\d{1,12}", role_id):
+        return None
+    return f"https://www.workatastartup.com/application?signup_job_id={role_id}"
 
 
 def _looks_like_sign_in(state: dict[str, Any]) -> bool:
@@ -669,12 +691,23 @@ def _fill_connected_chrome_page(client: _ChromeDevtoolsClient, page_id: int, pay
     )
     if not application_form_found:
         links = [item for item in state.get("links", []) if isinstance(item, dict) and not _is_generic_yc_apply_url(str(item.get("href") or ""))]
+        _LOGGER.info("Portal apply inspection host=%s path=%s candidate_labels=%s", urlsplit(page_url).hostname, urlsplit(page_url).path, [item.get("text") for item in links])
         if len(links) != 1:
             return {"status": "needs_manual_navigation", "filled": [], "uploaded": [], "needs_user": ["Open the application form in Chrome, then choose Continue here."], "message": "Neural Ant did not find one direct Apply link. Open the form in your regular Chrome window, then continue here."}
         destination = str(links[0].get("href") or "")
+        if not destination:
+            # Work at a Startup can render the role's Apply control without an
+            # href. Use its observed, role-specific profile route.
+            yc_destination = _yc_profile_application_url(posting_url, page_url)
+            if yc_destination:
+                destination = yc_destination
+            else:
+                return {"status": "needs_manual_navigation", "filled": [], "uploaded": [], "needs_user": ["Open the application form in Chrome, then choose Continue here."], "message": "The Apply control has no direct link Neural Ant can follow. Open the form in your regular Chrome window, then continue here."}
         if not is_public_https_url(destination) or not _allowed_application_host(page_url, destination):
             return {"status": "unrecognized_portal", "filled": [], "uploaded": [], "needs_user": ["Review the Apply link destination in Chrome."], "message": "The Apply link opens an unrecognized site. Neural Ant left your profile and résumé unshared."}
         client.tool("navigate_page", {"pageId": page_id, "type": "url", "url": destination, "timeout": 30000}, timeout=35)
+        target_parts = urlsplit(destination)
+        _LOGGER.info("Portal apply navigation target_host=%s target_path=%s page=%s", target_parts.hostname, target_parts.path, page_id)
         page = _resolve_application_page(client, page_id, posting_url)
         if page:
             page_id = int(page["id"])
@@ -682,6 +715,8 @@ def _fill_connected_chrome_page(client: _ChromeDevtoolsClient, page_id: int, pay
         if not is_public_https_url(page_url) or not _allowed_application_host(destination, page_url):
             return {"status": "unrecognized_portal", "filled": [], "uploaded": [], "needs_user": ["Review the redirected employer portal in Chrome."], "message": "The Apply link redirected to an unrecognized site. Neural Ant left your profile and résumé unshared."}
         state = _mcp_page_state(client, page_id)
+        result_parts = urlsplit(str(state.get("url") or ""))
+        _LOGGER.info("Portal apply navigation result host=%s path=%s title=%s fields=%d files=%d", result_parts.hostname, result_parts.path, state.get("title"), len(state.get("fields", [])), len(state.get("files", [])))
         if "/authenticate" in str(state.get("url") or "").casefold() and not state.get("passwordCount"):
             for _ in range(5):
                 time.sleep(0.5)
@@ -694,8 +729,35 @@ def _fill_connected_chrome_page(client: _ChromeDevtoolsClient, page_id: int, pay
                         break
         if _looks_like_sign_in(state):
             return {"status": "sign_in_required", "filled": [], "uploaded": [], "needs_user": ["Sign in to the employer portal in your regular Chrome window, then continue here."], "message": "Sign in using your existing Chrome session, then continue here.", "_page_id": page_id}
+        page_url = str(state.get("url") or page_url)
         fields = [item for item in state.get("fields", []) if isinstance(item, dict)]
         files = [item for item in state.get("files", []) if isinstance(item, dict)]
+        application_form_found = bool(files) or any(
+            item.get("visible") and _field_value({**item, "_approved_sensitive_answers": approved_sensitive_answers}, payload["profile"]) is not None
+            for item in fields
+        )
+        yc_profile_route = _yc_profile_application_url(posting_url, page_url)
+        if yc_profile_route and not application_form_found:
+            client.tool("navigate_page", {"pageId": page_id, "type": "url", "url": yc_profile_route, "timeout": 30000}, timeout=35)
+            profile_parts = urlsplit(yc_profile_route)
+            _LOGGER.info("Portal YC profile navigation target_host=%s target_path=%s page=%s", profile_parts.hostname, profile_parts.path, page_id)
+            for _ in range(12):
+                page = _resolve_application_page(client, page_id, posting_url)
+                if page:
+                    page_id = int(page["id"])
+                state = _mcp_page_state(client, page_id)
+                page_url = str(state.get("url") or (page.get("url") if page else page_url))
+                fields = [item for item in state.get("fields", []) if isinstance(item, dict)]
+                files = [item for item in state.get("files", []) if isinstance(item, dict)]
+                application_form_found = bool(files) or any(
+                    item.get("visible") and _field_value({**item, "_approved_sensitive_answers": approved_sensitive_answers}, payload["profile"]) is not None
+                    for item in fields
+                )
+                if application_form_found or "/application/" in urlsplit(page_url).path or _looks_like_sign_in(state):
+                    break
+                time.sleep(0.35)
+            if _looks_like_sign_in(state):
+                return {"status": "sign_in_required", "filled": [], "uploaded": [], "needs_user": ["Sign in to the employer portal in your regular Chrome window, then continue here."], "message": "Sign in using your existing Chrome session, then continue here.", "_page_id": page_id}
 
     operations = []
     labels_by_index: dict[int, str] = {}
@@ -747,7 +809,12 @@ def _fill_connected_chrome_page(client: _ChromeDevtoolsClient, page_id: int, pay
             continue
         if len(matches) != 1:
             if target == "resume":
-                needs_user.append("Resume upload field was not identified; attach the tailored résumé manually if needed.")
+                current_page = urlsplit(page_url)
+                is_yc_profile = (current_page.hostname or "").casefold() in {"www.workatastartup.com", "workatastartup.com"} and current_page.path.casefold().startswith("/application/")
+                if not matches and is_yc_profile:
+                    needs_user.append("This Y Combinator profile step has no résumé upload field, so Neural Ant did not attach the tailored PDF.")
+                else:
+                    needs_user.append("Resume upload field was not identified; attach the tailored résumé manually if needed.")
             continue
         if not _file_accepts_path(str(matches[0].get("accept") or ""), path):
             needs_user.append(f"The {target} upload accepts another file format; attach an accepted version manually.")

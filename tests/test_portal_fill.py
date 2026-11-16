@@ -73,6 +73,7 @@ class ConnectedChromePreparationTests(unittest.TestCase):
             self.state = state
             self.after_navigation = after_navigation
             self.calls = []
+            self.navigation_index = 0
 
         def tool(self, name, arguments=None, timeout=30):
             arguments = arguments or {}
@@ -85,7 +86,12 @@ class ConnectedChromePreparationTests(unittest.TestCase):
                 value = [item["index"] for item in json.loads(match.group(1))] if match else self.state
                 return {"content": [{"type": "text", "text": "Script ran on page and returned:\n```json\n" + json.dumps(value) + "\n```"}]}
             if name == "navigate_page":
-                self.state = self.after_navigation or self.state
+                if isinstance(self.after_navigation, list):
+                    if self.navigation_index < len(self.after_navigation):
+                        self.state = self.after_navigation[self.navigation_index]
+                        self.navigation_index += 1
+                else:
+                    self.state = self.after_navigation or self.state
                 return {"content": [{"type": "text", "text": "Navigated."}]}
             if name == "take_snapshot":
                 return {"structuredContent": {"snapshot": {"root": {"role": "RootWebArea", "name": "Application", "children": [
@@ -177,6 +183,89 @@ class ConnectedChromePreparationTests(unittest.TestCase):
         self.assertEqual(result["status"], "sign_in_required")
         navigation = next(args for name, args in client.calls if name == "navigate_page")
         self.assertIn("account.ycombinator.com/authenticate", navigation["url"])
+
+    def test_work_at_a_startup_apply_anchor_without_href_uses_role_specific_route(self):
+        posting_url = "https://www.ycombinator.com/companies/epsilab-com/jobs/research-engineer"
+        posting = {
+            "url": "https://www.workatastartup.com/jobs/121224",
+            "title": "Research Engineer at Epsilab",
+            "text": "Role details",
+            "passwordCount": 0,
+            "fields": [],
+            "files": [],
+            "links": [{"text": "Apply", "href": "", "visible": True, "inForm": False}],
+        }
+        profile_page = {
+            "url": "https://www.workatastartup.com/application/personal",
+            "title": "My Profile | Y Combinator's Work at a Startup",
+            "text": "About me",
+            "passwordCount": 0,
+            "fields": [{"index": 0, "tag": "input", "type": "email", "visible": True, "label": "Email Address (Personal)", "required": True, "value": ""}],
+            "files": [],
+            "links": [],
+        }
+        with tempfile.TemporaryDirectory(prefix="neural-ant-yc-profile-no-upload-test-") as temp_dir:
+            resume = Path(temp_dir) / "epsilab-resume.docx"
+            resume.write_bytes(b"tailored resume")
+            client = self.FakeClient(posting, after_navigation=profile_page)
+            result = _fill_connected_chrome_page(client, 7, {
+                "url": posting_url,
+                "profile": PROFILE,
+                "resume_path": str(resume),
+                "cover_letter_path": "",
+            })
+        self.assertEqual(result["status"], "ready")
+        navigation = next(args for name, args in client.calls if name == "navigate_page")
+        self.assertEqual(navigation["url"], "https://www.workatastartup.com/application?signup_job_id=121224")
+        self.assertEqual(result["filled"], ["Email Address (Personal)"])
+        self.assertEqual(result["uploaded"], [])
+        self.assertTrue(any("Y Combinator profile step has no résumé upload field" in item for item in result["needs_user"]))
+
+    def test_yc_auth_redirect_then_work_at_a_startup_role_page_reaches_profile_form(self):
+        posting_url = "https://www.ycombinator.com/companies/epsilab-com/jobs/research-engineer"
+        posting = {
+            "url": posting_url,
+            "title": "Research Engineer at Epsilab",
+            "text": "Role details",
+            "passwordCount": 0,
+            "fields": [],
+            "files": [],
+            "links": [{"text": "Apply to role ›", "href": "https://account.ycombinator.com/authenticate?continue=https%3A%2F%2Fwww.workatastartup.com%2F%3Fsignup_job_id%3D121224", "visible": True, "inForm": False}],
+        }
+        wta_role = {
+            "url": "https://www.workatastartup.com/jobs/121224",
+            "title": "Research Engineer at Epsilab",
+            "text": "Role details",
+            "passwordCount": 0,
+            "fields": [],
+            "files": [],
+            "links": [{"text": "Apply", "href": "", "visible": True, "inForm": False}],
+        }
+        profile_page = {
+            "url": "https://www.workatastartup.com/application/personal",
+            "title": "My Profile | Y Combinator's Work at a Startup",
+            "text": "About me",
+            "passwordCount": 0,
+            "fields": [{"index": 0, "tag": "input", "type": "email", "visible": True, "label": "Email Address (Personal)", "required": True, "value": ""}],
+            "files": [{"index": 0, "label": "Autofill with resume", "accept": "", "visible": True}],
+            "links": [],
+        }
+        with tempfile.TemporaryDirectory(prefix="neural-ant-yc-two-hop-test-") as temp_dir:
+            resume = Path(temp_dir) / "epsilab-resume.docx"
+            resume.write_bytes(b"tailored resume")
+            client = self.FakeClient(posting, after_navigation=[wta_role, profile_page])
+            result = _fill_connected_chrome_page(client, 7, {
+                "url": posting_url,
+                "profile": PROFILE,
+                "resume_path": str(resume),
+                "cover_letter_path": "",
+                "approved_sensitive_answers": {"us_work_authorized": "Yes", "us_visa_sponsorship": "Yes"},
+            })
+        navigation = [args["url"] for name, args in client.calls if name == "navigate_page"]
+        self.assertEqual(navigation, [posting["links"][0]["href"], "https://www.workatastartup.com/application?signup_job_id=121224"])
+        self.assertEqual(result["status"], "ready")
+        self.assertEqual(result["filled"], ["Email Address (Personal)"])
+        self.assertEqual(result["uploaded"], ["tailored resume"])
 
     def test_yc_profile_redirect_accepts_saved_data_and_attaches_resume(self):
         posting_url = "https://www.ycombinator.com/companies/epsilab-com/jobs/PqLmCN4-member-of-technical-staff-research-engineer-reinforcement-learning"
