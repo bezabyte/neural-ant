@@ -436,7 +436,7 @@ body,.app{background:var(--cream);color:var(--navy)}
 .application-card-expanded .interview-panel{margin-top:11px}
 .application-card-expanded .interview-panel summary,.application-card-expanded .saved-followups summary{font-size:10px}
 @media(max-width:650px){.kanban{grid-template-columns:1fr;gap:10px}.kanban .column{padding:0}.colhead{position:static}.jobcard .tracker-actions{gap:5px}.jobcard .tracker-actions .btn{font-size:9px}}
-button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid rgba(255,107,91,.62);outline-offset:2px}
+button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{outline:3px solid var(--navy);outline-offset:2px;box-shadow:0 0 0 2px var(--coral)}
 @media(max-width:950px){.app{grid-template-columns:205px minmax(0,1fr)}.sidebar{padding-right:12px;padding-left:12px}.content{padding:18px 20px 40px}.chat-intro{padding-top:18px}}
 @media(max-width:650px){.app{display:block}.sidebar{position:sticky;top:0;height:auto;padding:9px 10px 7px;gap:8px;display:block;background:var(--paper);border-right:0;border-bottom:1px solid var(--line)}.brand{padding:0 3px 7px}.logo{height:31px;width:31px}.brand strong{font-size:13px}.brand small{font-size:9px}.navlabel,.sidebottom{display:none}.nav{display:flex;overflow-x:auto;gap:4px;padding:2px 0}.nav button{min-height:34px;padding:7px 10px;gap:5px;flex:none;background:transparent}.nav .ico{display:none}.nav .txt{display:block;white-space:nowrap}.nav .txt span{font-size:10px}.topbar{height:47px;padding:0 14px}.content{padding:13px 12px 26px}.chat-home{gap:11px}.chat-intro{padding:11px 3px 1px}.chat-intro h1{font-size:28px}.chat-intro p{font-size:12px}.chat-workflow{padding:13px}.resume-drop{min-height:66px;padding:10px;gap:9px}.resume-upload-copy small{font-size:9px}.choose-file{padding:6px 8px}.home-resume-status{font-size:9px}.one-click-button{min-height:44px}.chat-privacy{font-size:9px}.workflow-card-heading{margin-bottom:10px}.commands-drawer summary span,.advanced-settings summary span{display:none}.chat-composer{position:static}.kanban{grid-template-columns:1fr 1fr;gap:7px}.pagehead h1{font-size:24px}}
 @media(prefers-reduced-motion:reduce){html{scroll-behavior:auto}*,*:before,*:after{scroll-behavior:auto!important;animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
@@ -572,3 +572,6 @@ button:focus-visible,a:focus-visible,summary:focus-visible,input:focus-visible,s
  .application-row-actions .posting-link{width:100%;margin-bottom:2px}
  .application-document-actions{display:grid;grid-template-columns:1fr}
 }
+
+.skip-link{position:fixed;z-index:20;top:8px;left:8px;padding:10px 13px;border-radius:9px;background:var(--coral);color:var(--navy);font-size:12px;font-weight:750;text-decoration:none;transform:translateY(-160%);transition:transform .15s ease}
+.skip-link:focus,.skip-link:focus-visible{transform:translateY(0);outline:3px solid var(--navy);outline-offset:3px}
