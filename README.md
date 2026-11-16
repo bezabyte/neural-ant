@@ -96,6 +96,7 @@ The API docs are available at `/api/docs` outside production mode. Frontend asse
 |---|---|
 | [Deployment and local setup](docs/deployment.md) | Local run, static preview hosting, and full private cloud deployment. |
 | [Workflow parity](docs/ai-job-search-workflow-parity.md) | Command-by-command comparison with the [`ai-job-search`](https://github.com/ai-job-search-dev/ai-job-search) workflow and current gaps. |
+| [UI transcript review](docs/ui-transcript-review.md) | Audit of Neural Ant's UX against four AI Engineer transcripts, including changes and remaining limits. |
 | [Job-source API notes](docs/job-source-apis.md) | Supported adapters, data sources, and API limitations. |
 | [Matching research](docs/matching-research.md) | Rationale behind the fit dimensions and ranking gates. |
 | [Local MCP setup](docs/local-mcp.md) | Connect Codex or VS Code to the local, read-only job-search tools. |
