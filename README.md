@@ -23,19 +23,19 @@
   <a href="docs/ai-job-search-workflow-parity.md"><b>Workflow notes</b></a>
 </p>
 
-> Neural Ant prepares and tracks your application materials. You review the job, complete the employer's form, and submit it yourself.
+> Neural Ant prepares your role-specific materials, opens the employer form in a dedicated local browser, and fills blank fields that map to saved profile facts. You review the form and submit it yourself.
 
 ## How it works
 
-The Chat page combines the reference workflow—`/setup → /scrape → /rank → /apply`—into a short flow. Upload a PDF or DOCX resume and Neural Ant starts matching searches automatically; **Search again** reruns them later. Independent job sources run in parallel, then listings are ranked against the saved profile. Select up to five roles and prepare them in one batch, or prepare a single role from its card. Each saved review pack includes a role-specific resume and cover letter plus copy-ready profile facts. Employer forms, legal attestations, and final submission stay with you. **A/B timing** compares the same search plan in parallel and sequential modes; timing history stays in the browser and stores durations and counts only.
+The Chat page combines the reference workflow—`/setup → /scrape → /rank → /apply`—into a short flow. Upload a PDF or DOCX resume and Neural Ant starts matching searches automatically; **Search again** reruns them later. Independent job sources run in parallel, then listings are ranked against the saved profile. Select up to five roles to prepare review packs together, or choose **Prepare to apply** on one role. For a single role, Neural Ant tailors the resume and cover letter, opens the employer form in Chrome, uploads the tailored files, and fills blank fields it can map to saved profile facts. It reports fields that still need you. The employer receives data only for the role you selected. You review the form and submit it yourself; authentication, human checks, visa/legal attestations, EEO questions, and unknown answers stay with you. **A/B timing** compares the same search plan in parallel and sequential modes; timing history stays in the browser and stores durations and counts only.
 
 | Step | What Neural Ant does |
 |---|---|
 | **Set up** | Extracts supported profile and application-history details from your resume for you to verify. |
 | **Find** | Searches configured public job boards and a live remote tech-job index. |
 | **Rank** | Scores role fit and keeps eligibility, language, location, work mode, contract type, and sponsorship evidence visible. |
-| **Prepare** | After you select roles, creates reviewable, job-specific resume and cover-letter drafts plus saved-profile facts, in batches of up to five. |
-| **You apply** | You review the listing and drafts, then complete and submit the employer application yourself. |
+| **Prepare** | Creates reviewable, job-specific resume and cover-letter drafts. For one selected role, opens the employer form in Chrome, uploads the tailored documents, and fills supported saved-profile fields. |
+| **You apply** | You review every document and form field, handle sign-in and employer attestations, then submit the application yourself. |
 
 Slash commands remain available for individual steps: `/setup`, `/scrape`, `/rank`, `/apply`, `/interview`, and `/outcome`. `/help` shows the command list. These commands open Neural Ant's feature screens; the command box is not a general-purpose chatbot.
 
@@ -63,13 +63,15 @@ On the first run, the script installs dependencies, builds the interface, and cr
 
 Local mode stores the database and resume under `data/` and listens on your Mac only. It runs while the Mac and terminal process are active. Do not expose the local server to a network.
 
+The first local run also installs Playwright Chromium if Chrome is not already installed. Portal preparation opens a visible, separate Chrome tab in Neural Ant's own browser profile at `~/.neural-ant/portal-browser`. Employer sign-in sessions can persist there on this device; use **Forget portal sign-ins** on the review screen to remove them. This browser profile is separate from your everyday Chrome profile.
+
 ## Privacy and boundaries
 
 - Neural Ant is designed for a single user. Local mode opens without a sign-in screen and binds to `127.0.0.1`; production mode uses password protection.
 - Resume files are stored outside Git, in the local `data/` directory or an optional private volume / Google Cloud Storage bucket. Keep resumes, exports, credentials, and `.env` files out of this public repository.
 - Freehire receives the role query and search filters, not your resume or work-authorization details.
 - External AI processing happens only after you opt in. Redaction is best-effort and may miss unusual formats.
-- Neural Ant does not scrape or reverse-engineer LinkedIn, fill employer forms, answer attestations, send recruiter messages, or submit applications.
+- Neural Ant does not scrape or reverse-engineer LinkedIn, answer work-authorization, legal, demographic, or role-specific questions, send recruiter messages, or submit applications. Portal autofill is limited to blank, labeled fields with a direct match to saved profile facts; it is best-effort and must be reviewed.
 - Verify job details, compensation, work authorization, and sponsorship with the employer. Historical filing data is context, not a role-specific commitment.
 
 ## Preview and deployment
@@ -96,6 +98,7 @@ The API docs are available at `/api/docs` outside production mode. Frontend asse
 |---|---|
 | [Deployment and local setup](docs/deployment.md) | Local run, static preview hosting, and full private cloud deployment. |
 | [Workflow parity](docs/ai-job-search-workflow-parity.md) | Command-by-command comparison with the [`ai-job-search`](https://github.com/ai-job-search-dev/ai-job-search) workflow and current gaps. |
+| [Local employer-form preparation](docs/local-portal-preparation.md) | One-click tailoring, local Chrome autofill, privacy, and review boundaries. |
 | [UI transcript review](docs/ui-transcript-review.md) | Audit of Neural Ant's UX against four AI Engineer transcripts, including changes and remaining limits. |
 | [Job-source API notes](docs/job-source-apis.md) | Supported adapters, data sources, and API limitations. |
 | [Matching research](docs/matching-research.md) | Rationale behind the fit dimensions and ranking gates. |

@@ -17,6 +17,7 @@ os.environ["SEARCH_INTERVAL_SECONDS"] = "0"
 
 import httpx
 from sqlalchemy import delete, event, func, select
+from starlette.requests import Request
 
 from api import main as appmod
 
@@ -80,6 +81,35 @@ class BatchPrepareEndpointTests(unittest.TestCase):
     def post_batch(self, job_ids, **extra):
         body = {"confirmed_resume_use": True, "job_ids": job_ids, **extra}
         return self.request_json("POST", "/api/applications/batch-prepare", body)
+
+    @staticmethod
+    def local_request(host="127.0.0.1"):
+        return Request({
+            "type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
+            "method": "POST", "scheme": "http", "path": "/api/applications/1/prepare-portal",
+            "raw_path": b"/api/applications/1/prepare-portal", "query_string": b"",
+            "headers": [], "client": (host, 1234), "server": ("127.0.0.1", 8080),
+        })
+
+    def test_portal_handoff_uses_the_saved_tailored_draft_and_local_browser_only(self):
+        prepared = self.post_batch([1])
+        self.assertEqual(prepared.status_code, 200, prepared.text)
+        application_id = prepared.json()["roles"][0]["application_id"]
+        with appmod.SessionLocal() as db:
+            with patch.object(appmod, "is_public_https_url", return_value=True), patch.object(
+                appmod, "start_portal_run", return_value={"run_id": "local-fixture", "status": "queued"}
+            ) as start_run:
+                response = appmod.prepare_application_portal(application_id, self.local_request(), None, db)
+                self.assertEqual(response["status"], "queued")
+                kwargs = start_run.call_args.kwargs
+                self.assertEqual(kwargs["application_id"], application_id)
+                self.assertTrue(kwargs["resume_bytes"].startswith(b"PK"))
+                self.assertIn("Example_1", kwargs["resume_filename"])
+                self.assertTrue(kwargs["cover_letter_bytes"].startswith(b"PK"))
+
+        with self.assertRaises(appmod.HTTPException) as raised:
+            appmod.prepare_application_portal(application_id, self.local_request("192.168.1.12"), None, db)
+        self.assertEqual(raised.exception.status_code, 403)
 
     @staticmethod
     def request_json(method, path, body=None):

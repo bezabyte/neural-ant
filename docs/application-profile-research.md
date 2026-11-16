@@ -13,7 +13,7 @@ Official portal documentation shows the recurring profile categories:
 - SAP SuccessFactors: candidate-profile background elements support multiple work, education, and language entries, while application forms add job- and region-specific fields.
 - SmartRecruiters, Taleo, and Jobvite similarly support attachments, custom screening questions, consent/privacy choices, and job-specific application flows.
 
-Neural Ant keeps these fields in a reusable local profile for setup, job ranking, and document drafting. Employer application forms remain outside the app: the user reviews the official posting, uploads the prepared documents, answers job-specific questions, and submits on the employer site. Neural Ant does not store employer passwords or credentials.
+Neural Ant keeps supported fields in a reusable local profile for setup, job ranking, document drafting, and local browser form preparation. After the user selects one role, Neural Ant can upload its tailored documents and fill blank, clearly labeled form fields that map directly to saved profile facts. Employer-specific questions, attestations, and final submission remain under user control. Neural Ant does not store employer passwords; its dedicated local browser profile may retain sign-in cookies on the device and can be cleared from the review screen.
 
 ## Reusable profile schema
 

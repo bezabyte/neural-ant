@@ -1,4 +1,4 @@
-const $=id=>document.getElementById(id);let apiSourceCredentials={};let externalAiConfigured=false;let evaluatedManualJob=null;let savedResume=null;let savedJobsCache=[];let preparedApplicationId=null;let selectedJobIds=new Set();const api=async(path,options={})=>{const response=await fetch('/api'+path,{credentials:'same-origin',...options,headers:{...(options.body instanceof FormData?{}:{'Content-Type':'application/json'}),...(options.headers||{})}});let data={};try{data=await response.json()}catch{}if(!response.ok)throw Error(data.detail||`Request failed (${response.status})`);return data};
+const $=id=>document.getElementById(id);let apiSourceCredentials={};let externalAiConfigured=false;let evaluatedManualJob=null;let savedResume=null;let savedJobsCache=[];let preparedApplicationId=null;let activePortalRunId=null;let selectedJobIds=new Set();const api=async(path,options={})=>{const response=await fetch('/api'+path,{credentials:'same-origin',...options,headers:{...(options.body instanceof FormData?{}:{'Content-Type':'application/json'}),...(options.headers||{})}});let data={};try{data=await response.json()}catch{}if(!response.ok)throw Error(data.detail||`Request failed (${response.status})`);return data};
 function toast(message){const e=$('toast');e.textContent=message;e.classList.add('show');setTimeout(()=>e.classList.remove('show'),2800)}function esc(value){return String(value??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function showPage(page,{load=true}={}){document.querySelectorAll('.panel').forEach(x=>x.classList.toggle('active',x.id===page));document.querySelectorAll('.nav button').forEach(button=>{const active=button.dataset.page===page;button.classList.toggle('active',active);if(active)button.setAttribute('aria-current','page');else button.removeAttribute('aria-current')});$('crumb').textContent={overview:'Home',matcher:'Fit check',agents:'Search roles',tracker:'Applications',copilot:'Drafts',profile:'Profile',tools:'Tools'}[page]||page;if(page==='agents'&&load){loadSources();loadJobs()}if(page==='tracker'&&load)loadApplications();window.scrollTo(0,0)}
 function parseList(value){return value.split(',').map(x=>x.trim()).filter(Boolean)}function setVal(id,value){if($(id))$(id).value=value??''}
 async function checkSession(){try{await api('/session');$('loginOverlay')?.classList.add('hidden');await initialize()}catch(e){toast(e.message)}}
@@ -169,6 +169,52 @@ async function loadSavedDraftPreview(jobId,draftId){
  const draft=matches.find(item=>draftId&&Number(item.id)===Number(draftId))||matches[0];
  return draft?{content:draft.content||'',cover_letter:draft.cover_letter||'',review_notes:draft.review_notes||'',model:draft.model||''}:null;
 }
+function updatePortalRunUi(run){
+ const panel=$("portalPreparation");if(!panel)return;panel.classList.remove("hidden");
+ const status=$("portalPreparationStatus"),details=$("portalPreparationDetails"),continueButton=$("continuePortalButton");
+ const messages={queued:"Opening the employer form in Chrome…",opening:"Opening and preparing the employer form…",ready:"Employer form is ready in Chrome. Review every entry and submit it yourself.",sign_in_required:"Sign in to the employer portal in Chrome, then continue here.",needs_manual_navigation:"The job page is open in Chrome. Open its application form, then continue here.",human_verification_required:"Complete the human check in Chrome. Review the form before you submit it.",unrecognized_portal:"The portal site could not be verified. Review it manually; no profile data or résumé was sent.",failed:"Neural Ant could not prepare this employer form."};
+ if(status)status.textContent=run.message&&run.status==="failed"?run.message:(messages[run.status]||run.message||"Preparing the employer form…");
+ const lines=[];
+ if(run.host)lines.push("Employer site: "+run.host);
+ if(run.filled?.length)lines.push("Filled "+run.filled.length+" profile fields: "+run.filled.join(", "));
+ if(run.uploaded?.length)lines.push("Attached: "+run.uploaded.join(", "));
+ if(run.needs_user?.length)lines.push("For you to review: "+run.needs_user.join(" · "));
+ if(run.status==="ready"&&!run.uploaded?.includes("tailored resume"))lines.push("Attach the tailored résumé manually if this form has an upload field.");
+ if(details)details.textContent=lines.join("\n");
+ if(continueButton)continueButton.classList.toggle("hidden",!['sign_in_required','needs_manual_navigation'].includes(run.status));
+}
+const portalPause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+async function pollPortalRun(runId){
+ for(let attempt=0;attempt<90;attempt++){
+  const run=await api('/portal-runs/'+encodeURIComponent(runId));
+  updatePortalRunUi(run);
+  if(!['queued','opening'].includes(run.status))return run;
+  await portalPause(700);
+ }
+ updatePortalRunUi({status:'opening',message:'Chrome is still opening the employer form. Keep Neural Ant running.'});
+ return null;
+}
+async function openPortalForReview(applicationId){
+ const panel=$("portalPreparation");if(panel)panel.classList.remove("hidden");
+ updatePortalRunUi({status:'queued',message:'Opening the employer application in a separate Chrome tab…'});
+ try{
+  const run=await api('/applications/'+applicationId+'/prepare-portal',{method:'POST'});
+  activePortalRunId=run.run_id;
+  await pollPortalRun(activePortalRunId);
+ }catch(error){
+  updatePortalRunUi({status:'failed',message:error.message||'Could not open the employer form.'});
+ }
+}
+async function continuePortalPreparation(){
+ if(!activePortalRunId)return;
+ const button=$("continuePortalButton");if(button){button.disabled=true;button.textContent='Continuing…'}
+ try{const run=await api('/portal-runs/'+encodeURIComponent(activePortalRunId)+'/continue',{method:'POST'});updatePortalRunUi(run);await pollPortalRun(activePortalRunId)}catch(error){updatePortalRunUi({status:'failed',message:error.message||'Could not continue form preparation.'})}
+ finally{if(button){button.disabled=false;button.textContent='Fill after sign-in'}}
+}
+async function forgetPortalSessions(){
+ if(!confirm('Close Neural Ant browser tabs and remove saved employer sign-ins from this device?'))return;
+ try{const run=await api('/portal-browser/forget-sessions',{method:'POST'});activePortalRunId=run.run_id;await pollPortalRun(activePortalRunId);toast('Saved employer sign-ins removed from this device.')}catch(error){toast(error.message)}
+}
 async function prepareApplication(id,button=null){
  const job=savedJobsCache.find(item=>Number(item.id)===Number(id));
  if(!job){toast('This posting is no longer in the current results. Refresh search and try again.');return}
@@ -193,15 +239,17 @@ async function prepareApplication(id,button=null){
   $('coverLetterResult').textContent=preview.cover_letter?'COVER LETTER DRAFT\n\n'+preview.cover_letter:'';$('coverLetterResult').classList.toggle('hidden',!preview.cover_letter);
   $('applicationReviewResult').textContent='REVIEW NOTES\n\n'+(preview.review_notes||'No review notes returned.');$('applicationReviewResult').classList.remove('hidden');
   const fields=result.application_answers||[];
-  $('applicationAnswersResult').textContent=fields.map(field=>field.label+(field.status==='review'?' [REVIEW]':field.status==='missing'?' [MISSING]':'')+': '+(field.value||'[Not saved — answer manually]')).join('\n')+'\n\nReview before using. Answer legal work-authorization, sponsorship, salary, EEO, signature, CAPTCHA, and role-specific questions yourself.';
+  $('applicationAnswersResult').textContent=fields.map(field=>field.label+(field.status==='review'?' [REVIEW]':field.status==='missing'?' [MISSING]':'')+': '+(field.value||'[Not saved — answer manually]')).join('\n')+'\n\nReview all values. Neural Ant fills only supported saved-profile facts; answer legal work-authorization, sponsorship, salary, EEO, signature, CAPTCHA, and role-specific questions yourself.';
   $('applicationAnswersResult').classList.remove('hidden');
   $('copyApplicationAnswersButton').classList.remove('hidden');
   $('applicationPackActions').classList.remove('hidden');
   $('applicationPostingLink').href=job.url;
-  $('applicationPackStatus').textContent=role.status==='existing'?'An existing draft was kept. Review it before applying.':'Role-specific review pack is ready. Nothing was sent to the employer.';
+  $('applicationPackStatus').textContent=role.status==='existing'?'An existing tailored draft was kept. Opening the employer form in Chrome.':'Role-specific review pack is ready. Opening the employer form in Chrome.';
   $('copyApplicationAnswersButton').disabled=false;
+  $('portalPreparation').classList.remove('hidden');
   showPage('copilot');
-  toast(role.status==='existing'?'Existing application pack opened for review.':'Application pack prepared for review.');
+  void openPortalForReview(role.application_id);
+  toast(role.status==='existing'?'Tailored application opened for review.':'Application prepared; opening the form for review.');
  }catch(e){toast(e.message)}
  finally{if(button){button.disabled=false;button.textContent=previousLabel||'Prepare application'}}
 }

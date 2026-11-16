@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from difflib import SequenceMatcher
 import hashlib
 import hmac
+import ipaddress
 import io
 import json
 import logging
@@ -36,6 +37,14 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from api.docx_export import build_cover_letter_docx, build_resume_docx
+from api.portal_fill import (
+    continue_portal_run,
+    forget_portal_sessions,
+    get_portal_run,
+    is_public_https_url,
+    shutdown_portal_browser_worker,
+    start_portal_run,
+)
 
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
@@ -1804,6 +1813,7 @@ def automatic_search_loop() -> None:
 @app.on_event("shutdown")
 def stop_automatic_search() -> None:
     global _search_thread
+    shutdown_portal_browser_worker()
     if _search_thread is not None:
         _search_stop.set()
         thread = _search_thread
@@ -2751,6 +2761,92 @@ def download_application_resume(application_id: int, _: None = Depends(require_a
     )
 
 
+def require_local_portal_browser(request: Request) -> None:
+    """Visible portal automation is available only from the local app."""
+    if APP_ENV == "production":
+        raise HTTPException(status_code=403, detail="Portal preparation is available only in local Neural Ant mode.")
+    client_host = request.client.host if request.client else ""
+    try:
+        local = ipaddress.ip_address(client_host).is_loopback
+    except ValueError:
+        local = APP_ENV == "test" and client_host == "testclient"
+    if not local:
+        raise HTTPException(status_code=403, detail="Open Neural Ant from this device to prepare an employer form.")
+
+
+@app.post("/api/applications/{application_id}/prepare-portal")
+def prepare_application_portal(
+    application_id: int,
+    request: Request,
+    _: None = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Open the selected employer page and fill only verified blank fields."""
+    require_local_portal_browser(request)
+    application = db.get(ApplicationRow, application_id)
+    if not application:
+        raise HTTPException(status_code=404, detail="Application not found.")
+    job = application.job
+    if not is_public_https_url(job.url):
+        raise HTTPException(status_code=422, detail="This posting does not have a safe public HTTPS application link.")
+    resume = db.get(ResumeRow, 1)
+    if not resume:
+        raise HTTPException(status_code=409, detail="Upload a resume first.")
+    draft = db.scalars(
+        select(DraftRow).where(DraftRow.job_id == job.id).order_by(DraftRow.created_at.desc())
+    ).first()
+    if not draft:
+        raise HTTPException(status_code=409, detail="Prepare and review this role's tailored documents first.")
+    profile = ensure_profile(db).data or DEFAULT_PROFILE
+    active_template = db.scalars(select(ResumeTemplateRow).where(ResumeTemplateRow.active.is_(True))).first()
+    resume_bytes = build_resume_docx(
+        profile,
+        job,
+        draft.content,
+        resume.extracted_text,
+        template_bytes=active_template.content if active_template else None,
+    )
+    resume_name = resume_filename(profile, job)
+    cover_letter_bytes = b""
+    cover_letter_name = ""
+    if draft.cover_letter:
+        cover_letter_bytes = build_cover_letter_docx(profile, job, draft.cover_letter)
+        cover_letter_name = resume_name.removesuffix("_Resume.docx") + "_Cover_Letter.docx"
+    return start_portal_run(
+        application_id=application.id,
+        job=job,
+        profile=profile,
+        resume_bytes=resume_bytes,
+        resume_filename=resume_name,
+        cover_letter_bytes=cover_letter_bytes,
+        cover_letter_filename=cover_letter_name,
+    )
+
+
+@app.get("/api/portal-runs/{run_id}")
+def portal_run_status(run_id: str, request: Request, _: None = Depends(require_auth)):
+    require_local_portal_browser(request)
+    result = get_portal_run(run_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Portal preparation run not found. Prepare the role again.")
+    return result
+
+
+@app.post("/api/portal-runs/{run_id}/continue")
+def continue_portal_preparation(run_id: str, request: Request, _: None = Depends(require_auth)):
+    require_local_portal_browser(request)
+    result = continue_portal_run(run_id)
+    if not result:
+        raise HTTPException(status_code=404, detail="Portal preparation run not found. Prepare the role again.")
+    return result
+
+
+@app.post("/api/portal-browser/forget-sessions")
+def remove_portal_browser_sessions(request: Request, _: None = Depends(require_auth)):
+    require_local_portal_browser(request)
+    return forget_portal_sessions()
+
+
 def csv_safe_cell(value: Any) -> str:
     text = str(value or "")
     if text.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
@@ -3461,11 +3557,12 @@ def batch_prepare_applications(body: BatchPrepareBody, _: None = Depends(require
         "roles": role_results,
         "application_answers": application_answer_fields(profile) if body.include_preview else None,
         "manual_review": [
-            "Check every saved profile value before copying it into the employer form.",
+            "Review every value entered in the employer form, including saved-profile fields.",
             "Answer legal work-authorization and sponsorship attestations, salary questions, EEO items, signatures, and CAPTCHAs yourself.",
-            "Employer portal forms are not automatically filled or submitted by this workflow.",
+            "Single-role preparation can fill supported fields and upload tailored documents in local Chrome; bulk preparation only saves review packs.",
+            "Neural Ant never submits the application.",
         ] if body.include_preview else None,
-        "warning": "Drafts only. Review every claim and complete employer applications yourself.",
+        "warning": "Review every document and employer-form value. You complete any remaining questions and submit the application yourself.",
     }
 
 

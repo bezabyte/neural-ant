@@ -20,6 +20,17 @@ fi
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
+if [ ! -x "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && \
+   [ ! -x "$HOME/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" ] && \
+   ! command -v google-chrome >/dev/null 2>&1 && \
+   ! command -v google-chrome-stable >/dev/null 2>&1 && \
+   ! command -v chromium >/dev/null 2>&1 && \
+   ! command -v chromium-browser >/dev/null 2>&1; then
+  browser_path="$(python -c 'from playwright.sync_api import sync_playwright; p=sync_playwright().start(); print(p.chromium.executable_path); p.stop()')"
+  if [ ! -x "$browser_path" ]; then
+    python -m playwright install chromium
+  fi
+fi
 npm run build
 
 if [ ! -f .env.local ]; then
